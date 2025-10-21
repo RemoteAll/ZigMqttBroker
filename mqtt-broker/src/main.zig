@@ -16,6 +16,7 @@ const AutoHashMap = std.AutoHashMap;
 const Client = @import("client.zig").Client;
 const ClientError = @import("client.zig").ClientError;
 const BufferPool = @import("buffer_pool.zig").BufferPool;
+const SendWorkerPool = @import("send_worker_pool.zig").SendWorkerPool;
 
 // MQTT broker
 const MqttBroker = struct {
@@ -24,18 +25,27 @@ const MqttBroker = struct {
     next_client_id: u64,
     subscriptions: SubscriptionTree,
     buffer_pool: BufferPool,
+    send_pool: SendWorkerPool,
 
-    pub fn init(allocator: Allocator) MqttBroker {
+    pub fn init(allocator: Allocator) !MqttBroker {
+        // 使用 CPU 核心数作为工作线程数
+        const cpu_count = std.Thread.getCpuCount() catch 4;
+        const send_pool = try SendWorkerPool.init(allocator, @intCast(cpu_count * 2));
+
         return MqttBroker{
             .allocator = allocator,
             .clients = AutoHashMap(u64, *Client).init(allocator),
             .next_client_id = 1,
             .subscriptions = SubscriptionTree.init(allocator),
             .buffer_pool = BufferPool.init(allocator, config.READ_BUFFER_SIZE, 100),
+            .send_pool = send_pool,
         };
     }
 
     pub fn deinit(self: *MqttBroker) void {
+        // 停止发送线程池
+        self.send_pool.deinit();
+
         var it = self.clients.iterator();
         while (it.next()) |entry| {
             const client = entry.value_ptr.*;
@@ -53,6 +63,12 @@ const MqttBroker = struct {
             std.log.info("🚀 MQTT Broker Starting", .{});
             std.log.info("==================================================", .{});
         }
+
+        // 启动发送线程池
+        try self.send_pool.start();
+        const cpu_count = std.Thread.getCpuCount() catch 4;
+        std.log.info("📤 Send worker pool started with {} threads", .{cpu_count * 2});
+
         const self_addr = try net.Address.resolveIp("0.0.0.0", port);
         var listener = try self_addr.listen(.{ .reuse_address = true });
         if (config.ENABLE_VERBOSE_LOGGING) {
@@ -399,30 +415,27 @@ const MqttBroker = struct {
                     try shared_writer.finishPacket();
                     const shared_data = shared_writer.buffer[0..shared_writer.pos];
 
-                    // 批量转发优化: 并发发送给所有订阅者
-                    // 使用线程池可以进一步优化,但当前使用简单的并发写入
-                    var send_count: usize = 0;
-                    var failed_count: usize = 0;
+                    // 优化: 使用线程池批量并发发送
+                    // 过滤出已连接的订阅者
+                    var connected_subscribers: std.ArrayList(*Client) = .{};
+                    defer connected_subscribers.deinit(self.allocator);
 
                     for (matched_clients.items) |subscriber| {
-                        // 检查订阅者连接状态
-                        if (!subscriber.is_connected) {
-                            continue;
+                        if (subscriber.is_connected) {
+                            try connected_subscribers.append(self.allocator, subscriber);
                         }
-
-                        // 优化: 使用非阻塞方式发送,避免一个慢客户端阻塞其他客户端
-                        subscriber.safeWriteToStream(shared_data) catch |err| {
-                            failed_count += 1;
-                            if (config.ENABLE_VERBOSE_LOGGING) {
-                                std.log.err("Failed to send PUBLISH to client {}: {any}", .{ subscriber.id, err });
-                            }
-                            continue;
-                        };
-                        send_count += 1;
                     }
 
-                    if (config.ENABLE_VERBOSE_LOGGING and send_count > 0) {
-                        std.log.info("   📨 Forwarded to {} subscribers ({} failed)", .{ send_count, failed_count });
+                    if (connected_subscribers.items.len > 0) {
+                        // 批量提交到线程池
+                        try self.send_pool.submitBatch(connected_subscribers.items, shared_data);
+
+                        if (config.ENABLE_VERBOSE_LOGGING) {
+                            std.log.info("   📨 Submitted {} send tasks to worker pool (queue: {})", .{
+                                connected_subscribers.items.len,
+                                self.send_pool.queueSize(),
+                            });
+                        }
                     }
 
                     // 移动 reader 位置到末尾
@@ -478,7 +491,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var broker = MqttBroker.init(allocator);
+    var broker = try MqttBroker.init(allocator);
     defer broker.deinit();
 
     // TODO have a config file that updates values in config.zig
