@@ -255,7 +255,7 @@ pub fn read(reader: *packet.Reader, allocator: Allocator) !*ConnectPacket {
     return cp;
 }
 
-pub fn connack(writer: *packet.Writer, stream: *net.Stream, reason_code: mqtt.ReasonCode) (packet.PacketWriterError || ConnectError || posix.WriteError)!void {
+pub fn connack(writer: *packet.Writer, stream: *net.Stream, reason_code: mqtt.ReasonCode) !void {
     std.debug.print("--- CONNACK packet ---\n", .{});
 
     try writer.startPacket(mqtt.Command.CONNACK);
@@ -284,7 +284,7 @@ pub fn connack(writer: *packet.Writer, stream: *net.Stream, reason_code: mqtt.Re
     std.debug.print("----------------\n", .{});
 }
 
-pub fn disconnect(writer: *packet.Writer, stream: *net.Stream, reason_code: mqtt.ReasonCode) (packet.PacketWriterError || ConnectError || posix.WriteError)!void {
+pub fn disconnect(writer: *packet.Writer, stream: *net.Stream, reason_code: mqtt.ReasonCode) !void {
     try writer.startPacket(mqtt.Command.DISCONNECT);
 
     // Disconnect Reason Code

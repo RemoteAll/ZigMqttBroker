@@ -47,10 +47,10 @@ const MqttBroker = struct {
         std.log.info("Starting mqtt server", .{});
         const self_addr = try net.Address.resolveIp("0.0.0.0", port);
         var listener = try self_addr.listen(.{ .reuse_address = true });
-        std.log.info("Listening on {}", .{self_addr});
+        std.log.info("Listening on {any}", .{self_addr});
 
         while (listener.accept()) |conn| {
-            std.log.info("Accepted client connection from: {}", .{conn.address});
+            std.log.info("Accepted client connection from: {any}", .{conn.address});
 
             const client_id = self.getNextClientId();
             const client = try Client.init(self.allocator, client_id, mqtt.ProtocolVersion.Invalid, conn.stream, conn.address);
@@ -59,7 +59,7 @@ const MqttBroker = struct {
             // er... use a threadpool for clients? or is this OK
             _ = try std.Thread.spawn(.{}, handleClient, .{ self, client });
         } else |err| {
-            std.log.info("Error accepting client connection: {}", .{err});
+            std.log.info("Error accepting client connection: {any}", .{err});
         }
     }
 
@@ -83,13 +83,28 @@ const MqttBroker = struct {
             self.allocator.free(read_buffer);
         }
 
-        std.debug.print("Client {} is connecting\n", .{client.address});
+        std.debug.print("Client {any} is connecting\n", .{client.address});
+        std.debug.print("Stream handle: {any}\n", .{client.stream.handle});
+        std.debug.print("Read buffer size: {}\n", .{read_buffer.len});
+
+        // 短暂延迟，让客户端有时间准备
+        std.Thread.sleep(10 * std.time.ns_per_ms);
 
         // client event loop
         while (true) {
+            std.debug.print("Attempting to read from client {}...\n", .{client.id});
             const length = client.stream.read(read_buffer) catch |err| {
-                std.log.err("Error reading from client {}: {}", .{ client.id, err });
-                return ClientError.ClientReadError;
+                // 优雅处理连接关闭和网络错误
+                switch (err) {
+                    error.ConnectionResetByPeer, error.BrokenPipe, error.Unexpected => {
+                        std.log.info("Client {} connection closed: {any}", .{ client.id, err });
+                        return;
+                    },
+                    else => {
+                        std.log.err("Error reading from client {}: {any}", .{ client.id, err });
+                        return;
+                    },
+                }
             };
 
             if (length == 0) {
@@ -98,7 +113,7 @@ const MqttBroker = struct {
             }
 
             reader.start(length) catch |err| {
-                std.log.err("Error starting reader: {}", .{err});
+                std.log.err("Error starting reader: {any}", .{err});
                 return;
             };
 

@@ -50,7 +50,7 @@ pub const ConnectPacket = struct {
     ) !*ConnectPacket {
         const connect_packet = try allocator.create(ConnectPacket);
         connect_packet.* = .{
-            .errors = ArrayList(PacketError).init(allocator),
+            .errors = .{},
             .allocator = allocator,
             .connect_flags = .{
                 .username = false,
@@ -62,7 +62,7 @@ pub const ConnectPacket = struct {
                 .reserved = false,
             },
             .keep_alive = 60,
-            .user_properties = std.ArrayList(UserProperty).init(allocator),
+            .user_properties = .{},
             .client_identifier = "",
         };
 
@@ -86,16 +86,16 @@ pub const ConnectPacket = struct {
 
     pub fn deinit(self: *ConnectPacket) void {
         std.debug.print("Deinitializing ConnectPacket\n", .{});
-        self.user_properties.deinit();
+        self.user_properties.deinit(self.allocator);
         if (self.will_properties) |*will_props| {
-            will_props.user_properties.deinit();
+            will_props.user_properties.deinit(self.allocator);
         }
-        self.errors.deinit();
+        self.errors.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
     pub fn addError(self: *ConnectPacket, err: PacketError) !void {
-        try self.errors.append(err);
+        try self.errors.append(self.allocator, err);
     }
 
     pub fn getErrors(self: *const ConnectPacket) []const PacketError {

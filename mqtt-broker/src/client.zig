@@ -117,9 +117,9 @@ pub const Client = struct {
             .will_qos = .AtMostOnce,
             .will_retain = false,
             .will_delay_interval = 0,
-            .subscriptions = std.ArrayList(Subscription).init(allocator),
-            .incoming_queue = std.ArrayList(Message).init(allocator),
-            .outgoing_queue = std.ArrayList(Message).init(allocator),
+            .subscriptions = .{},
+            .incoming_queue = .{},
+            .outgoing_queue = .{},
             .receive_maximum = 65535,
             .maximum_packet_size = 268435455, // Default to 256 MiB
             .topic_alias_maximum = 0,
@@ -137,9 +137,9 @@ pub const Client = struct {
         if (self.will_topic) |topic| self.allocator.free(topic);
         if (self.will_payload) |payload| self.allocator.free(payload);
         // self.allocator.free(self.identifer);
-        self.subscriptions.deinit();
-        self.incoming_queue.deinit();
-        self.outgoing_queue.deinit();
+        self.subscriptions.deinit(self.allocator);
+        self.incoming_queue.deinit(self.allocator);
+        self.outgoing_queue.deinit(self.allocator);
         self.user_properties.deinit();
         self.inflight_messages.deinit();
         self.allocator.destroy(self);

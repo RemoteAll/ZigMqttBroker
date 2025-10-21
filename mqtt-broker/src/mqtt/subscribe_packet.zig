@@ -9,17 +9,18 @@ pub const SubscribePacket = struct {
     topics: std.ArrayList(SubscribeTopic),
 
     pub fn init(allocator: Allocator, packet_id: u16) SubscribePacket {
+        _ = allocator;
         return .{
             .packet_id = packet_id,
             .subscription_identifier = null,
-            .user_properties = std.ArrayList(UserProperty).init(allocator),
-            .topics = std.ArrayList(SubscribeTopic).init(allocator),
+            .user_properties = .{},
+            .topics = .{},
         };
     }
 
-    pub fn deinit(self: *SubscribePacket) void {
-        self.user_properties.deinit();
-        self.topics.deinit();
+    pub fn deinit(self: *SubscribePacket, allocator: Allocator) void {
+        self.user_properties.deinit(allocator);
+        self.topics.deinit(allocator);
     }
 
     pub const UserProperty = struct {
