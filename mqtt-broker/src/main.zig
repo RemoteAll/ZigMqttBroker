@@ -281,14 +281,8 @@ const MqttBroker = struct {
 
                     std.debug.print("Found {} matching subscribers\n", .{matched_clients.items.len});
 
-                    // 转发消息给每个订阅者(跳过发送者自己)
+                    // 转发消息给每个订阅者(包括发送者自己)
                     for (matched_clients.items) |subscriber| {
-                        // 跳过发送者自己
-                        if (subscriber.id == client.id) {
-                            std.debug.print("Skipping sender client {}\n", .{client.id});
-                            continue;
-                        }
-
                         std.debug.print("Forwarding message to client {}\n", .{subscriber.id});
 
                         // 为每个订阅者创建新的 writer

@@ -91,8 +91,8 @@ pub const Reader = struct {
     }
 
     pub fn readRemainingLength(self: *Reader) !usize {
-        if (self.pos >= self.length - 1) {
-            // std.debug.print("+++ readRemainingLength> error: self.pos ({d}) > self.length ({d})\n", .{ self.pos, self.length });
+        if (self.pos >= self.length) {
+            // std.debug.print("+++ readRemainingLength> error: self.pos ({d}) >= self.length ({d})\n", .{ self.pos, self.length });
             return PacketReaderError.BufferTooSmall;
         }
 
