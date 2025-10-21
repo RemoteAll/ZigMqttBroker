@@ -27,6 +27,9 @@ pub const Client = struct {
     connect_time: i64,
     last_activity: i64,
 
+    // 写锁,保护 stream 的并发写入
+    write_mutex: std.Thread.Mutex,
+
     // MQTT session properties
     clean_start: bool,
     session_expiry_interval: u32,
@@ -107,6 +110,7 @@ pub const Client = struct {
             .is_connected = false,
             .connect_time = 0,
             .last_activity = 0,
+            .write_mutex = std.Thread.Mutex{},
             .clean_start = true,
             .session_expiry_interval = 0,
             .keep_alive = 0,
@@ -128,6 +132,18 @@ pub const Client = struct {
             .inflight_messages = std.AutoHashMap(u16, Message).init(allocator),
         };
         return client;
+    }
+
+    /// 线程安全的写入方法
+    pub fn safeWriteToStream(self: *Client, data: []const u8) !void {
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+
+        if (!self.is_connected) {
+            return ClientError.ClientNotFound;
+        }
+
+        _ = try self.stream.write(data);
     }
 
     pub fn deinit(self: *Client) void {

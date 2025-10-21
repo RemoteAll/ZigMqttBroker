@@ -255,7 +255,7 @@ pub fn read(reader: *packet.Reader, allocator: Allocator) !*ConnectPacket {
     return cp;
 }
 
-pub fn connack(writer: *packet.Writer, stream: *net.Stream, reason_code: mqtt.ReasonCode) !void {
+pub fn connack(writer: *packet.Writer, client: *Client, reason_code: mqtt.ReasonCode) !void {
     std.debug.print("--- CONNACK packet ---\n", .{});
 
     try writer.startPacket(mqtt.Command.CONNACK);
@@ -279,7 +279,9 @@ pub fn connack(writer: *packet.Writer, stream: *net.Stream, reason_code: mqtt.Re
 
     try writer.finishPacket();
 
-    try writer.writeToStream(stream);
+    // 使用线程安全的写入方法
+    const data = writer.buffer[0..writer.pos];
+    try client.safeWriteToStream(data);
 
     std.debug.print("----------------\n", .{});
 }

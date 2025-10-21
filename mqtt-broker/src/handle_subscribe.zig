@@ -77,7 +77,7 @@ pub fn read(reader: *packet.Reader, client: *Client, allocator: Allocator) !*Sub
     return sp;
 }
 
-pub fn suback(writer: *packet.Writer, stream: *net.Stream, packet_id: u16, client: *Client) !void {
+pub fn suback(writer: *packet.Writer, client: *Client, packet_id: u16) !void {
     std.debug.print("Sending SUBACK to client {}\n", .{client.id});
 
     try writer.startPacket(mqtt.Command.SUBACK);
@@ -90,5 +90,7 @@ pub fn suback(writer: *packet.Writer, stream: *net.Stream, packet_id: u16, clien
 
     try writer.finishPacket();
 
-    try writer.writeToStream(stream);
+    // 使用线程安全的写入方法
+    const data = writer.buffer[0..writer.pos];
+    try client.safeWriteToStream(data);
 }
