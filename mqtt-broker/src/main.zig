@@ -56,8 +56,9 @@ const MqttBroker = struct {
             const client = try Client.init(self.allocator, client_id, mqtt.ProtocolVersion.Invalid, conn.stream, conn.address);
             try self.clients.put(client_id, client);
 
-            // er... use a threadpool for clients? or is this OK
-            _ = try std.Thread.spawn(.{}, handleClient, .{ self, client });
+            // 创建独立线程处理每个客户端连接
+            const thread = try std.Thread.spawn(.{}, handleClient, .{ self, client });
+            thread.detach(); // 分离线程,允许并发处理多个客户端
         } else |err| {
             std.log.info("Error accepting client connection: {any}", .{err});
         }
@@ -358,14 +359,14 @@ const MqttBroker = struct {
                     std.debug.print("Client {} sent PUBREC\n", .{client.id});
                 },
                 .PINGREQ => {
-                    std.debug.print("Client {} sent PINGREQ\n", .{client.id});
+                    std.debug.print(">>> Client {} sent PINGREQ (heartbeat) <<<\n", .{client.id});
 
                     // 发送 PINGRESP
                     try writer.startPacket(mqtt.Command.PINGRESP);
                     try writer.finishPacket();
                     try writer.writeToStream(&client.stream);
 
-                    std.debug.print("Server sent PINGRESP to Client {}\n", .{client.id});
+                    std.debug.print("<<< Server sent PINGRESP to Client {} (heartbeat response) <<<\n", .{client.id});
                 },
                 .DISCONNECT => {
                     std.debug.print("Client {} sent DISCONNECT\n", .{client.id});
