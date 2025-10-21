@@ -189,6 +189,9 @@ const MqttBroker = struct {
             // 标记客户端为已断开,避免其他线程尝试写入
             client.is_connected = false;
 
+            // 清理客户端的所有订阅
+            self.subscriptions.removeClientAllSubscriptions(client.id);
+
             _ = self.clients.remove(client.id);
             client.deinit();
             writer.deinit();
@@ -416,23 +419,14 @@ const MqttBroker = struct {
                     const shared_data = shared_writer.buffer[0..shared_writer.pos];
 
                     // 优化: 使用线程池批量并发发送
-                    // 过滤出已连接的订阅者
-                    var connected_subscribers: std.ArrayList(*Client) = .{};
-                    defer connected_subscribers.deinit(self.allocator);
-
-                    for (matched_clients.items) |subscriber| {
-                        if (subscriber.is_connected) {
-                            try connected_subscribers.append(self.allocator, subscriber);
-                        }
-                    }
-
-                    if (connected_subscribers.items.len > 0) {
+                    // matched_clients 已经只包含已连接的客户端（在 match 中过滤）
+                    if (matched_clients.items.len > 0) {
                         // 批量提交到线程池
-                        try self.send_pool.submitBatch(connected_subscribers.items, shared_data);
+                        try self.send_pool.submitBatch(matched_clients.items, shared_data);
 
                         if (config.ENABLE_VERBOSE_LOGGING) {
                             std.log.info("   📨 Submitted {} send tasks to worker pool (queue: {})", .{
-                                connected_subscribers.items.len,
+                                matched_clients.items.len,
                                 self.send_pool.queueSize(),
                             });
                         }

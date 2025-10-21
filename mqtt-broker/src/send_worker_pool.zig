@@ -11,7 +11,10 @@ pub const SendTask = struct {
     pub fn execute(self: *SendTask) void {
         // 使用线程安全的写入
         self.client.safeWriteToStream(self.data) catch |err| {
-            std.log.err("Failed to send to client {}: {any}", .{ self.client.id, err });
+            // ClientNotFound 表示客户端已断开，这是正常情况，不需要记录错误
+            if (err != error.ClientNotFound) {
+                std.log.err("Failed to send to client {}: {any}", .{ self.client.id, err });
+            }
         };
     }
 };

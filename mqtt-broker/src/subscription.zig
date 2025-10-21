@@ -28,9 +28,11 @@ pub const SubscriptionTree = struct {
             debugPrint(">> Node.subscribe() >> topic_levels.len={}\n", .{topic_levels.len});
 
             if (topic_levels.len == 0) {
-                // 检查是否已订阅（去重）
-                for (self.subscribers.items) |existing_client| {
-                    if (existing_client.id == client.id) {
+                // 检查是否已订阅（去重）- 反向遍历，新订阅通常在末尾
+                var i: usize = self.subscribers.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (self.subscribers.items[i].id == client.id) {
                         debugPrint(">> Client {} already subscribed, skipping\n", .{client.id});
                         return;
                     }
@@ -86,13 +88,35 @@ pub const SubscriptionTree = struct {
             }
         }
 
+        pub fn removeClient(self: *Node, client_id: u64) void {
+            // 从当前节点移除客户端
+            var i: usize = 0;
+            while (i < self.subscribers.items.len) {
+                if (self.subscribers.items[i].id == client_id) {
+                    _ = self.subscribers.swapRemove(i);
+                    debugPrint(">> Removed disconnected client {} from node\n", .{client_id});
+                } else {
+                    i += 1;
+                }
+            }
+
+            // 递归处理所有子节点
+            var it = self.children.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.removeClient(client_id);
+            }
+        }
+
         pub fn match(self: *Node, topic_levels: [][]const u8, matched_clients: *ArrayList(*Client), allocator: Allocator) !void {
             debugPrint(">> Node.match() >> topic_levels.len={}, subscribers.len={}\n", .{ topic_levels.len, self.subscribers.items.len });
 
             if (topic_levels.len == 0) {
                 debugPrint(">> Reached end of topic, adding {} subscribers\n", .{self.subscribers.items.len});
                 for (self.subscribers.items) |client| {
-                    try matched_clients.append(allocator, client);
+                    // 只添加仍然连接的客户端
+                    if (client.is_connected) {
+                        try matched_clients.append(allocator, client);
+                    }
                 }
                 return;
             }
@@ -204,6 +228,26 @@ pub const SubscriptionTree = struct {
         }
 
         return result;
+    }
+
+    /// 移除客户端的所有订阅（客户端断开连接时调用）
+    pub fn removeClientAllSubscriptions(self: *SubscriptionTree, client_id: u64) void {
+        debugPrint(">> removeClientAllSubscriptions() >> client_id: {}\n", .{client_id});
+
+        self.root.removeClient(client_id);
+
+        // 清空整个缓存，因为订阅关系改变了
+        self.cache_mutex.lock();
+        defer self.cache_mutex.unlock();
+
+        var cache_it = self.cache.iterator();
+        while (cache_it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.cache.clearRetainingCapacity();
+
+        debugPrint(">> All subscriptions and cache cleared for client {}\n", .{client_id});
     }
 
     /// 使缓存失效
