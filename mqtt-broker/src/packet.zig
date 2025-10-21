@@ -333,6 +333,15 @@ pub const Writer = struct {
         self.pos += string.len;
     }
 
+    /// 批量写入字节数组 (性能优化,避免逐字节循环)
+    pub fn writeBytes(self: *Writer, bytes: []const u8) !void {
+        if (self.pos + bytes.len > self.buffer.len) {
+            return PacketWriterError.BufferTooSmall;
+        }
+        @memcpy(self.buffer[self.pos..][0..bytes.len], bytes);
+        self.pos += bytes.len;
+    }
+
     fn encodeLengthBytes(length: usize) ![4]u8 {
         var result: [4]u8 = [_]u8{0} ** 4;
         var index: usize = 0;

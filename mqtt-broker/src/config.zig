@@ -6,3 +6,7 @@ pub const MAX_CLIENT_ID_LEN = 64;
 // TODO: make the  buffers longer, e.g. 2097152 max packet size to handle large payloads, etc.
 pub const READ_BUFFER_SIZE = 1024;
 pub const WRITE_BUFFER_SIZE = 1024;
+
+// 性能优化配置
+pub const ENABLE_VERBOSE_LOGGING = false; // 关闭详细日志以提高性能
+pub const ENABLE_HEX_DUMP = false; // 关闭十六进制转储

@@ -7,6 +7,14 @@ const mqtt = @import("mqtt.zig");
 const Client = @import("client.zig").Client;
 const SubscribePacket = @import("mqtt/subscribe_packet.zig").SubscribePacket;
 const assert = std.debug.assert;
+const config = @import("config.zig");
+
+const debugPrint = if (config.ENABLE_VERBOSE_LOGGING) debugPrint else struct {
+    fn print(comptime fmt: []const u8, args: anytype) void {
+        _ = fmt;
+        _ = args;
+    }
+}.print;
 
 pub const SubscribeError = error{
     InvalidPacket,
@@ -78,7 +86,7 @@ pub fn read(reader: *packet.Reader, client: *Client, allocator: Allocator) !*Sub
 }
 
 pub fn suback(writer: *packet.Writer, client: *Client, packet_id: u16) !void {
-    std.debug.print("Sending SUBACK to client {}\n", .{client.id});
+    debugPrint("Sending SUBACK to client {}\n", .{client.id});
 
     try writer.startPacket(mqtt.Command.SUBACK);
 

@@ -10,6 +10,14 @@ const ConnectPacket = @import("mqtt/connect_packet.zig").ConnectPacket;
 const Client = @import("client.zig").Client;
 const isValidClientId = @import("client.zig").isValidClientId;
 
+// 日志宏 - 根据配置决定是否打印
+const debugPrint = if (config.ENABLE_VERBOSE_LOGGING) debugPrint else struct {
+    fn print(comptime fmt: []const u8, args: anytype) void {
+        _ = fmt;
+        _ = args;
+    }
+}.print;
+
 pub const ConnectError = error{
     InvalidPacket,
     InvalidWillQoS,
@@ -49,15 +57,17 @@ pub fn read(reader: *packet.Reader, allocator: Allocator) !*ConnectPacket {
     const cp = try ConnectPacket.init(allocator);
     errdefer cp.deinit();
 
-    std.debug.print("--- CONNECT packet ---\n", .{});
+    if (config.ENABLE_VERBOSE_LOGGING) {
+        debugPrint("--- CONNECT packet ---\n", .{});
+    }
 
     // Protocol Name
-    std.debug.print("Reading protocol name\n", .{});
+    debugPrint("Reading protocol name\n", .{});
     cp.protocol_name = try reader.readUTF8String(false) orelse "";
     if (!std.mem.eql(u8, "MQTT", cp.protocol_name)) {
         try cp.addError(reader.getContextForError(ConnectError.ProtocolNameNotMQTT));
     }
-    std.debug.print("Protocol name: '{s}'\n", .{cp.protocol_name});
+    debugPrint("Protocol name: '{s}'\n", .{cp.protocol_name});
 
     // Protocol version
     cp.protocol_version = try reader.readByte();
@@ -66,7 +76,7 @@ pub fn read(reader: *packet.Reader, allocator: Allocator) !*ConnectPacket {
         break :blk null;
     };
     if (version) |v| {
-        std.debug.print("Protocol version: {X} ({s})\n", .{ cp.protocol_version, v.toString() });
+        debugPrint("Protocol version: {X} ({s})\n", .{ cp.protocol_version, v.toString() });
     }
 
     // version specific checks
@@ -90,21 +100,21 @@ pub fn read(reader: *packet.Reader, allocator: Allocator) !*ConnectPacket {
         .reserved = (cp.flags & FlagBitMask.reserved) != 0,
     };
 
-    std.debug.print("Connect flags: {X} ({b})\n", .{ cp.flags, cp.flags });
+    debugPrint("Connect flags: {X} ({b})\n", .{ cp.flags, cp.flags });
 
     // flag value - Clean session
     if (cp.connect_flags.clean_session) {
-        std.debug.print("Flag: clean session set\n", .{});
+        debugPrint("Flag: clean session set\n", .{});
     }
 
     // flag value - Will retain
     if (cp.connect_flags.will_retain) {
-        std.debug.print("Flag: will retain flag set\n", .{});
+        debugPrint("Flag: will retain flag set\n", .{});
     }
 
     // flag value - Will flag
     if (cp.connect_flags.will) {
-        std.debug.print("Flag: will flag set\n", .{});
+        debugPrint("Flag: will flag set\n", .{});
     }
 
     // flag value - will QoS
@@ -113,22 +123,22 @@ pub fn read(reader: *packet.Reader, allocator: Allocator) !*ConnectPacket {
         // perform bitwise AND to isolate bits 4 and 3
         // right-shift the result by 3 to move  Will QoS bits to least significant positions
         // truncate result to u2
-        std.debug.print("Flag: will QoS: {d}\n", .{cp.connect_flags.will_qos});
+        debugPrint("Flag: will QoS: {d}\n", .{cp.connect_flags.will_qos});
     }
 
     // flag value - username
     if (cp.connect_flags.username) {
-        std.debug.print("Flag: username flag set\n", .{});
+        debugPrint("Flag: username flag set\n", .{});
     }
 
     // flag value - password
     if (cp.connect_flags.password) {
-        std.debug.print("Flag: password flag set\n", .{});
+        debugPrint("Flag: password flag set\n", .{});
     }
 
     // flag value - reserved
     if (cp.connect_flags.reserved) {
-        std.debug.print("Flag: reserved flag set\n", .{});
+        debugPrint("Flag: reserved flag set\n", .{});
         //  [MQTT-3.1.2-3]
         const reserved: u1 = @truncate((cp.flags & FlagBitMask.reserved) >> 3);
         if (reserved != 0) try cp.addError(reader.getContextForError(ConnectError.MalformedPacket));
@@ -137,7 +147,7 @@ pub fn read(reader: *packet.Reader, allocator: Allocator) !*ConnectPacket {
     // Keep Alive
     const keep_alive = try reader.readTwoBytes();
     cp.keep_alive = keep_alive;
-    std.debug.print("Keep Alive: {d}\n", .{cp.keep_alive});
+    debugPrint("Keep Alive: {d}\n", .{cp.keep_alive});
 
     // [MQTT-3.1.3-1] Payload processing based on flags set, the fields MUST appear in the order:
     // Client Identifier
@@ -148,7 +158,7 @@ pub fn read(reader: *packet.Reader, allocator: Allocator) !*ConnectPacket {
 
     // Client ID
     cp.client_identifier = try reader.readClientId() orelse "";
-    std.debug.print("Client ID: '{s}'\n", .{cp.client_identifier});
+    debugPrint("Client ID: '{s}'\n", .{cp.client_identifier});
 
     // [MQTT-3.1.3-4] check if the client_id is valid UTF-8
     if (!std.unicode.utf8ValidateSlice(cp.client_identifier)) {
@@ -191,7 +201,7 @@ pub fn read(reader: *packet.Reader, allocator: Allocator) !*ConnectPacket {
             try cp.addError(reader.getContextForError(ConnectError.WillTopicMustBePresent));
         }
         cp.will_topic = will_topic;
-        std.debug.print("Will topic: '{?s}'\n", .{cp.will_topic});
+        debugPrint("Will topic: '{?s}'\n", .{cp.will_topic});
 
         // Will Message
         const will_message = try reader.readUTF8String(false) orelse "";
@@ -201,7 +211,7 @@ pub fn read(reader: *packet.Reader, allocator: Allocator) !*ConnectPacket {
             try cp.addError(reader.getContextForError(ConnectError.WillMessageMustBePresent));
         }
         cp.will_payload = will_message;
-        std.debug.print("Will payload: '{?s}'\n", .{cp.will_payload});
+        debugPrint("Will payload: '{?s}'\n", .{cp.will_payload});
     } else {
         // [MQTT-3.1.2-13]
         if (cp.connect_flags.will_qos != 0) try cp.addError(reader.getContextForError(ConnectError.WillQosMustBeZero));
@@ -232,7 +242,7 @@ pub fn read(reader: *packet.Reader, allocator: Allocator) !*ConnectPacket {
         // [MQTT-3.1.2-19]
         if (cp.username == null or cp.username.?.len == 0) try cp.addError(reader.getContextForError(ConnectError.UsernameMustBePresent));
 
-        std.debug.print("Username: '{?s}'\n", .{cp.username});
+        debugPrint("Username: '{?s}'\n", .{cp.username});
     }
 
     // Password
@@ -242,7 +252,7 @@ pub fn read(reader: *packet.Reader, allocator: Allocator) !*ConnectPacket {
         // [MQTT-3.1.2-21]
         if (cp.password == null or cp.password.?.len == 0) try cp.addError(reader.getContextForError(ConnectError.PasswordMustBePresent));
 
-        std.debug.print("Password: '{?s}'\n", .{cp.password});
+        debugPrint("Password: '{?s}'\n", .{cp.password});
     }
 
     // After parsing all expected fields, check if there's any unexpected extra data in the packet:
@@ -250,13 +260,13 @@ pub fn read(reader: *packet.Reader, allocator: Allocator) !*ConnectPacket {
         try cp.addError(reader.getContextForError(ConnectError.UnexpectedExtraData));
     }
 
-    std.debug.print("----------------\n", .{});
+    debugPrint("----------------\n", .{});
 
     return cp;
 }
 
 pub fn connack(writer: *packet.Writer, client: *Client, reason_code: mqtt.ReasonCode) !void {
-    std.debug.print("--- CONNACK packet ---\n", .{});
+    debugPrint("--- CONNACK packet ---\n", .{});
 
     try writer.startPacket(mqtt.Command.CONNACK);
 
@@ -270,12 +280,12 @@ pub fn connack(writer: *packet.Writer, client: *Client, reason_code: mqtt.Reason
         connect_acknowledge = connect_acknowledge_flags;
     }
     try writer.writeByte(connect_acknowledge);
-    std.debug.print("Connection acknowledge: {X}\n", .{connect_acknowledge});
+    debugPrint("Connection acknowledge: {X}\n", .{connect_acknowledge});
 
     // connection return / reason code
     try writer.writeByte(@intFromEnum(reason_code));
     var buffer: [1024]u8 = undefined;
-    std.debug.print("Reason Code: {s}\n", .{try reason_code.longDescription(&buffer)});
+    debugPrint("Reason Code: {s}\n", .{try reason_code.longDescription(&buffer)});
 
     try writer.finishPacket();
 
@@ -283,7 +293,7 @@ pub fn connack(writer: *packet.Writer, client: *Client, reason_code: mqtt.Reason
     const data = writer.buffer[0..writer.pos];
     try client.safeWriteToStream(data);
 
-    std.debug.print("----------------\n", .{});
+    debugPrint("----------------\n", .{});
 }
 
 pub fn disconnect(writer: *packet.Writer, stream: *net.Stream, reason_code: mqtt.ReasonCode) !void {

@@ -44,23 +44,40 @@ const MqttBroker = struct {
 
     // start the server on the given port
     pub fn start(self: *MqttBroker, port: u16) !void {
-        std.log.info("==================================================", .{});
-        std.log.info("🚀 MQTT Broker Starting", .{});
-        std.log.info("==================================================", .{});
+        if (config.ENABLE_VERBOSE_LOGGING) {
+            std.log.info("==================================================", .{});
+            std.log.info("🚀 MQTT Broker Starting", .{});
+            std.log.info("==================================================", .{});
+        }
         const self_addr = try net.Address.resolveIp("0.0.0.0", port);
         var listener = try self_addr.listen(.{ .reuse_address = true });
-        std.log.info("📡 Listening on port {}", .{port});
-        std.log.info("==================================================\n", .{});
+        if (config.ENABLE_VERBOSE_LOGGING) {
+            std.log.info("📡 Listening on port {}", .{port});
+            std.log.info("==================================================\n", .{});
+        }
 
         while (listener.accept()) |conn| {
             const client_id = self.getNextClientId();
 
-            std.log.info("\n╔════════════════════════════════════════════════╗", .{});
-            std.log.info("║ 🔌 NEW CLIENT CONNECTION", .{});
-            std.log.info("╠════════════════════════════════════════════════╣", .{});
-            std.log.info("║ Client ID: {}", .{client_id});
-            std.log.info("║ Address:   {any}", .{conn.address});
-            std.log.info("╚════════════════════════════════════════════════╝\n", .{});
+            if (config.ENABLE_VERBOSE_LOGGING) {
+                std.log.info("\n╔════════════════════════════════════════════════╗", .{});
+                std.log.info("║ 🔌 NEW CLIENT CONNECTION", .{});
+                std.log.info("╠════════════════════════════════════════════════╣", .{});
+                std.log.info("║ Client ID: {}", .{client_id});
+                std.log.info("║ Address:   {any}", .{conn.address});
+                std.log.info("╚════════════════════════════════════════════════╝\n", .{});
+            }
+
+            // 优化: 设置 TCP_NODELAY 禁用 Nagle 算法,减少延迟
+            if (@import("builtin").os.tag == .windows) {
+                const windows = std.os.windows;
+                const ws2_32 = windows.ws2_32;
+                const enable: c_int = 1;
+                _ = ws2_32.setsockopt(conn.stream.handle, ws2_32.IPPROTO.TCP, ws2_32.TCP.NODELAY, @ptrCast(&enable), @sizeOf(c_int));
+            } else {
+                const enable: c_int = 1;
+                _ = std.posix.setsockopt(conn.stream.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&enable)) catch {};
+            }
 
             const client = try Client.init(self.allocator, client_id, mqtt.ProtocolVersion.Invalid, conn.stream, conn.address);
             try self.clients.put(client_id, client);
@@ -84,46 +101,48 @@ const MqttBroker = struct {
         _ = self; // 当前未使用,但保留以便未来扩展
         const data = writer.buffer[0..writer.pos];
 
-        std.log.info("\n┌────────────────────────────────────────────────┐", .{});
-        std.log.info("│ 📤 SENDING to Client {}", .{client.id});
-        std.log.info("├────────────────────────────────────────────────┤", .{});
-        std.log.info("│ Packet Type: {s}", .{packet_type});
-        std.log.info("│ Length: {} bytes", .{data.len});
-        std.log.info("├────────────────────────────────────────────────┤", .{});
-        std.log.info("│ HEX:", .{});
-
-        // 十六进制格式 (每行16字节)
-        var i: usize = 0;
-        while (i < data.len) : (i += 16) {
-            const end = @min(i + 16, data.len);
-            std.debug.print("│ {X:0>4}:  ", .{i});
-
-            // 打印十六进制
-            for (data[i..end], 0..) |byte, j| {
-                std.debug.print("{X:0>2} ", .{byte});
-                if (j == 7) std.debug.print(" ", .{}); // 中间加空格
-            }
-
-            // 填充空白
-            const remaining = 16 - (end - i);
-            var pad: usize = 0;
-            while (pad < remaining) : (pad += 1) {
-                std.debug.print("   ", .{});
-                if (pad == 7) std.debug.print(" ", .{});
-            }
-
-            // 打印ASCII
-            std.debug.print(" │ ", .{});
-            for (data[i..end]) |byte| {
-                if (byte >= 32 and byte <= 126) {
-                    std.debug.print("{c}", .{byte});
-                } else {
-                    std.debug.print(".", .{});
-                }
-            }
-            std.debug.print("\n", .{});
+        if (config.ENABLE_VERBOSE_LOGGING) {
+            std.log.info("\n┌────────────────────────────────────────────────┐", .{});
+            std.log.info("│ 📤 SENDING to Client {}", .{client.id});
+            std.log.info("├────────────────────────────────────────────────┤", .{});
+            std.log.info("│ Packet Type: {s}", .{packet_type});
+            std.log.info("│ Length: {} bytes", .{data.len});
+            std.log.info("└────────────────────────────────────────────────┘", .{});
         }
-        std.log.info("└────────────────────────────────────────────────┘\n", .{});
+
+        if (config.ENABLE_HEX_DUMP) {
+            // 十六进制格式 (每行16字节)
+            var i: usize = 0;
+            while (i < data.len) : (i += 16) {
+                const end = @min(i + 16, data.len);
+                std.debug.print("│ {X:0>4}:  ", .{i});
+
+                // 打印十六进制
+                for (data[i..end], 0..) |byte, j| {
+                    std.debug.print("{X:0>2} ", .{byte});
+                    if (j == 7) std.debug.print(" ", .{}); // 中间加空格
+                }
+
+                // 填充空白
+                const remaining = 16 - (end - i);
+                var pad: usize = 0;
+                while (pad < remaining) : (pad += 1) {
+                    std.debug.print("   ", .{});
+                    if (pad == 7) std.debug.print(" ", .{});
+                }
+
+                // 打印ASCII
+                std.debug.print(" │ ", .{});
+                for (data[i..end]) |byte| {
+                    if (byte >= 32 and byte <= 126) {
+                        std.debug.print("{c}", .{byte});
+                    } else {
+                        std.debug.print(".", .{});
+                    }
+                }
+                std.debug.print("\n", .{});
+            }
+        }
 
         // 使用线程安全的写入方法
         try client.safeWriteToStream(data);
@@ -137,11 +156,15 @@ const MqttBroker = struct {
         var reader = packet.Reader.init(read_buffer);
 
         defer {
-            std.log.info("\n╔════════════════════════════════════════════════╗", .{});
-            std.log.info("║ 🔌 CLIENT DISCONNECTED", .{});
-            std.log.info("╠════════════════════════════════════════════════╣", .{});
-            std.log.info("║ Client ID: {}", .{client.id});
-            std.log.info("╚════════════════════════════════════════════════╝\n", .{});
+            if (config.ENABLE_VERBOSE_LOGGING) {
+                std.log.info("\n╔════════════════════════════════════════════════╗", .{});
+                std.log.info("║ 🔌 CLIENT DISCONNECTED", .{});
+                std.log.info("╠════════════════════════════════════════════════╣", .{});
+                std.log.info("║ Client ID: {}", .{client.id});
+                std.log.info("╚════════════════════════════════════════════════╝\n", .{});
+            } else {
+                std.log.info("Client {} disconnected", .{client.id});
+            }
 
             // 标记客户端为已断开,避免其他线程尝试写入
             client.is_connected = false;
@@ -190,50 +213,53 @@ const MqttBroker = struct {
             };
 
             if (length == 0) {
-                std.log.info("⚠️  Client {} sent 0 length packet, disconnected", .{client.id});
+                std.log.info("Client {} sent 0 length packet, disconnected", .{client.id});
                 return;
             }
 
-            // 打印接收到的完整原始数据
-            std.log.info("\n┌────────────────────────────────────────────────┐", .{});
-            std.log.info("│ 📥 RECEIVED from Client {}", .{client.id});
-            std.log.info("├────────────────────────────────────────────────┤", .{});
-            std.log.info("│ Length: {} bytes", .{length});
-            std.log.info("├────────────────────────────────────────────────┤", .{});
-
-            // 十六进制格式 (每行16字节)
-            std.log.info("│ HEX:", .{});
-            var i: usize = 0;
-            while (i < length) : (i += 16) {
-                const end = @min(i + 16, length);
-                std.debug.print("│ {X:0>4}:  ", .{i});
-
-                // 打印十六进制
-                for (read_buffer[i..end], 0..) |byte, j| {
-                    std.debug.print("{X:0>2} ", .{byte});
-                    if (j == 7) std.debug.print(" ", .{}); // 中间加空格
-                }
-
-                // 填充空白
-                const remaining = 16 - (end - i);
-                var pad: usize = 0;
-                while (pad < remaining) : (pad += 1) {
-                    std.debug.print("   ", .{});
-                    if (pad == 7) std.debug.print(" ", .{});
-                }
-
-                // 打印ASCII
-                std.debug.print(" │ ", .{});
-                for (read_buffer[i..end]) |byte| {
-                    if (byte >= 32 and byte <= 126) {
-                        std.debug.print("{c}", .{byte});
-                    } else {
-                        std.debug.print(".", .{});
-                    }
-                }
-                std.debug.print("\n", .{});
+            // 打印接收到的完整原始数据 (仅在详细模式)
+            if (config.ENABLE_VERBOSE_LOGGING) {
+                std.log.info("\n┌────────────────────────────────────────────────┐", .{});
+                std.log.info("│ 📥 RECEIVED from Client {}", .{client.id});
+                std.log.info("├────────────────────────────────────────────────┤", .{});
+                std.log.info("│ Length: {} bytes", .{length});
+                std.log.info("└────────────────────────────────────────────────┘", .{});
             }
-            std.log.info("└────────────────────────────────────────────────┘\n", .{});
+
+            if (config.ENABLE_HEX_DUMP) {
+                // 十六进制格式 (每行16字节)
+                std.log.info("│ HEX:", .{});
+                var i: usize = 0;
+                while (i < length) : (i += 16) {
+                    const end = @min(i + 16, length);
+                    std.debug.print("│ {X:0>4}:  ", .{i});
+
+                    // 打印十六进制
+                    for (read_buffer[i..end], 0..) |byte, j| {
+                        std.debug.print("{X:0>2} ", .{byte});
+                        if (j == 7) std.debug.print(" ", .{}); // 中间加空格
+                    }
+
+                    // 填充空白
+                    const remaining = 16 - (end - i);
+                    var pad: usize = 0;
+                    while (pad < remaining) : (pad += 1) {
+                        std.debug.print("   ", .{});
+                        if (pad == 7) std.debug.print(" ", .{});
+                    }
+
+                    // 打印ASCII
+                    std.debug.print(" │ ", .{});
+                    for (read_buffer[i..end]) |byte| {
+                        if (byte >= 32 and byte <= 126) {
+                            std.debug.print("{c}", .{byte});
+                        } else {
+                            std.debug.print(".", .{});
+                        }
+                    }
+                    std.debug.print("\n", .{});
+                }
+            }
 
             reader.start(length) catch |err| {
                 std.log.err("❌ Error starting reader: {any}", .{err});
@@ -316,20 +342,25 @@ const MqttBroker = struct {
                         self.allocator.destroy(subscribe_packet);
                     }
 
-                    std.log.info("📬 Client {} SUBSCRIBE (packet_id: {})", .{ client.id, subscribe_packet.packet_id });
-                    for (subscribe_packet.topics.items) |topic| {
-                        try self.subscriptions.subscribe(topic.filter, client);
-                        std.log.info("   ➕ Subscribed to: {s}", .{topic.filter});
+                    if (config.ENABLE_VERBOSE_LOGGING) {
+                        std.log.info("📬 Client {} SUBSCRIBE (packet_id: {})", .{ client.id, subscribe_packet.packet_id });
+                        for (subscribe_packet.topics.items) |topic| {
+                            try self.subscriptions.subscribe(topic.filter, client);
+                            std.log.info("   ➕ Subscribed to: {s}", .{topic.filter});
+                        }
+                    } else {
+                        for (subscribe_packet.topics.items) |topic| {
+                            try self.subscriptions.subscribe(topic.filter, client);
+                        }
                     }
 
                     // the Server MUST respond with a SUBACK Packet [MQTT-3.8.4-1]
                     try subscribe.suback(writer, client, subscribe_packet.packet_id);
-                    std.log.info("📤 Server sent SUBACK to Client {}", .{client.id});
                 },
                 .PUBLISH => {
                     // 读取 topic
                     const topic = try reader.readUTF8String(false) orelse {
-                        std.log.err("❌ PUBLISH packet missing topic", .{});
+                        std.log.err("PUBLISH packet missing topic", .{});
                         break;
                     };
 
@@ -338,71 +369,60 @@ const MqttBroker = struct {
                     const payload_length = reader.length - payload_start;
                     const payload = reader.buffer[payload_start..reader.length];
 
-                    std.log.info("📨 Client {} PUBLISH", .{client.id});
-                    std.log.info("   📍 Topic: {s}", .{topic});
-                    std.log.info("   📦 Payload: {} bytes", .{payload_length});
-                    if (payload_length > 0 and payload_length <= 100) {
-                        std.log.info("   💬 Content: {s}", .{payload});
+                    if (config.ENABLE_VERBOSE_LOGGING) {
+                        std.log.info("📨 Client {} PUBLISH", .{client.id});
+                        std.log.info("   📍 Topic: {s}", .{topic});
+                        std.log.info("   📦 Payload: {} bytes", .{payload_length});
+                        if (payload_length > 0 and payload_length <= 100) {
+                            std.log.info("   💬 Content: {s}", .{payload});
+                        }
                     }
 
                     // 查找匹配的订阅者
                     var matched_clients = try self.subscriptions.match(topic, &self.allocator);
                     defer matched_clients.deinit(self.allocator);
 
-                    std.log.info("   🔍 Found {} matching subscriber(s)", .{matched_clients.items.len});
+                    // 优化: 为所有订阅者构建一次 PUBLISH 包,重复使用
+                    var shared_writer = try packet.Writer.init(self.allocator);
+                    defer shared_writer.deinit();
+
+                    try shared_writer.startPacket(mqtt.Command.PUBLISH);
+                    try shared_writer.writeUTF8String(topic);
+
+                    // 优化: 批量写入 payload,而不是逐字节
+                    try shared_writer.writeBytes(payload);
+
+                    try shared_writer.finishPacket();
+                    const shared_data = shared_writer.buffer[0..shared_writer.pos];
 
                     // 转发消息给每个订阅者(包括发送者自己)
                     for (matched_clients.items) |subscriber| {
                         // 检查订阅者连接状态
                         if (!subscriber.is_connected) {
-                            std.log.warn("   ⚠️  Skipping disconnected client {}", .{subscriber.id});
                             continue;
                         }
 
-                        // 为每个订阅者创建新的 writer
-                        var subscriber_writer = try packet.Writer.init(self.allocator);
-                        defer subscriber_writer.deinit();
-
-                        // 构建 PUBLISH 包发送给订阅者
-                        try subscriber_writer.startPacket(mqtt.Command.PUBLISH);
-
-                        // 写入 topic
-                        try subscriber_writer.writeUTF8String(topic);
-
-                        // 写入 payload
-                        for (payload) |byte| {
-                            try subscriber_writer.writeByte(byte);
-                        }
-
-                        try subscriber_writer.finishPacket();
-
-                        // 使用线程安全的写入方法发送数据
-                        const data = subscriber_writer.buffer[0..subscriber_writer.pos];
-                        subscriber.safeWriteToStream(data) catch |err| {
-                            std.log.err("   ❌ Failed to send PUBLISH to client {}: {any}", .{ subscriber.id, err });
+                        // 使用线程安全的写入方法发送数据(重复使用同一份数据)
+                        subscriber.safeWriteToStream(shared_data) catch |err| {
+                            if (config.ENABLE_VERBOSE_LOGGING) {
+                                std.log.err("Failed to send PUBLISH to client {}: {any}", .{ subscriber.id, err });
+                            }
                             continue;
                         };
-
-                        std.log.info("   ✅ Forwarded to client {}", .{subscriber.id});
                     }
 
                     // 移动 reader 位置到末尾
                     reader.pos = reader.length;
                 },
                 .UNSUBSCRIBE => {
-                    std.log.info("📭 Client {} sent UNSUBSCRIBE", .{client.id});
-
                     // 读取 packet ID
                     const packet_id = try reader.readTwoBytes();
-                    std.log.info("   Packet ID: {}", .{packet_id});
 
                     // 读取要取消订阅的主题
-                    const topic = try reader.readUTF8String(false) orelse {
+                    _ = try reader.readUTF8String(false) orelse {
                         std.log.err("UNSUBSCRIBE packet missing topic", .{});
                         break;
                     };
-
-                    std.log.info("   Topic: {s}", .{topic});
 
                     // TODO: 实现从订阅树中移除客户端订阅
                     // try self.subscriptions.unsubscribe(topic, client);
@@ -417,10 +437,10 @@ const MqttBroker = struct {
                     reader.pos = reader.length;
                 },
                 .PUBREC => {
-                    std.log.info("📥 Client {} sent PUBREC", .{client.id});
+                    // 静默处理 PUBREC
                 },
                 .PINGREQ => {
-                    std.log.info("💓 Client {} sent PINGREQ (heartbeat)", .{client.id});
+                    // 静默处理 PINGREQ (心跳包)
 
                     // 发送 PINGRESP
                     try writer.startPacket(mqtt.Command.PINGRESP);
