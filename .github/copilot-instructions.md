@@ -48,11 +48,97 @@
 	- `std.mem.dupe` → 改为 `allocator.dupe`。
 	- `std.mem.copy` 语法变更，需查阅新版文档。
 	- `std.process.getEnvMap` 返回值类型变化，需用 `var` 而非 `const`。
-	- `std.ArrayList.init` 构造方式已调整，推荐用 `ArrayList(Type).init(allocator)`。
 	- 其他 API 变动请参考 Zig 官方 changelog。
 - 编写新代码时，优先查阅 Zig 0.15.2+ 官方文档，避免参考旧版示例。
 - 迁移/重构时，需逐一排查所有 API 用法，确保无旧接口残留。
 - 如遇编译报错涉及 API 变动，优先查 changelog 或官方文档，禁止临时绕过。
+
+### 5.2.1 ArrayList API 重大变更（Zig 0.15.2+）
+
+**核心变更：** `std.ArrayList(T)` 返回的是 `Aligned(T, null)` 类型，该类型不再内部存储 allocator。
+
+**禁止使用的旧 API：**
+- ❌ `std.ArrayList(T).init(allocator)` — 此方法已移除
+- ❌ `list.deinit()` — 缺少必需的 allocator 参数
+- ❌ `list.append(item)` — 缺少必需的 allocator 参数
+
+**正确用法：**
+
+1. **初始化 ArrayList**
+   ```zig
+   // 方式 1: 使用空结构体字面量（推荐）
+   var list: std.ArrayList(T) = .{};
+   
+   // 方式 2: 显式指定字段
+   var list = std.ArrayList(T){ .items = &.{}, .capacity = 0 };
+   
+   // 方式 3: 使用预定义的空常量
+   var list = std.ArrayList(T).empty;
+   ```
+
+2. **释放 ArrayList**
+   ```zig
+   // 必须传入 allocator
+   defer list.deinit(allocator);
+   ```
+
+3. **添加元素**
+   ```zig
+   // 必须传入 allocator 作为第一个参数
+   try list.append(allocator, item);
+   ```
+
+4. **其他常用操作**
+   ```zig
+   // 删除元素（不需要 allocator）
+   _ = list.orderedRemove(index);
+   const removed = list.swapRemove(index);
+   
+   // 访问元素（不变）
+   const item = list.items[index];
+   const len = list.items.len;
+   
+   // 清空但保留容量
+   list.clearRetainingCapacity();
+   
+   // 清空并释放内存
+   list.clearAndFree(allocator);
+   ```
+
+5. **结构体字段中的 ArrayList**
+   ```zig
+   pub const MyStruct = struct {
+       allocator: Allocator,
+       my_list: std.ArrayList(Item),
+       
+       pub fn init(allocator: Allocator) !MyStruct {
+           return MyStruct{
+               .allocator = allocator,
+               .my_list = .{},  // 使用空字面量初始化
+           };
+       }
+       
+       pub fn deinit(self: *MyStruct) void {
+           self.my_list.deinit(self.allocator);  // 传入 allocator
+       }
+       
+       pub fn addItem(self: *MyStruct, item: Item) !void {
+           try self.my_list.append(self.allocator, item);  // 传入 allocator
+       }
+   };
+   ```
+
+**迁移检查清单：**
+- [ ] 所有 `ArrayList.init(allocator)` 改为 `.{}` 或等效形式
+- [ ] 所有 `list.deinit()` 改为 `list.deinit(allocator)`
+- [ ] 所有 `list.append(item)` 改为 `list.append(allocator, item)`
+- [ ] 所有 `list.appendSlice(slice)` 改为 `list.appendSlice(allocator, slice)`
+- [ ] 所有 `list.clearAndFree()` 改为 `list.clearAndFree(allocator)`
+- [ ] 确认 `orderedRemove`、`swapRemove` 等不需要 allocator 的方法保持原样
+
+**常见错误提示：**
+- `error: struct 'array_list.Aligned(...)' has no member named 'init'` → 使用 `.{}` 初始化
+- `error: member function expected N argument(s), found M` → 检查是否缺少或多传了 allocator 参数
 
 ## 6. 文档注释
 - 示例可裁剪；避免泄露密钥、真实内部地址。
