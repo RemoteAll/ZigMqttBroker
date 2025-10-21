@@ -253,6 +253,13 @@ const MqttBroker = struct {
                 .PUBLISH => {
                     std.debug.print("Client {} sent PUBLISH\n", .{client.id});
 
+                    // 调试:打印原始 PUBLISH 包
+                    std.debug.print("Original PUBLISH packet: ", .{});
+                    for (reader.buffer[0..reader.length]) |b| {
+                        std.debug.print("{X:0>2} ", .{b});
+                    }
+                    std.debug.print("\n", .{});
+
                     // 读取 topic
                     const topic = try reader.readUTF8String(false) orelse {
                         std.log.err("PUBLISH packet missing topic", .{});
@@ -274,23 +281,49 @@ const MqttBroker = struct {
 
                     std.debug.print("Found {} matching subscribers\n", .{matched_clients.items.len});
 
-                    // 转发消息给每个订阅者
+                    // 转发消息给每个订阅者(跳过发送者自己)
                     for (matched_clients.items) |subscriber| {
-                        std.debug.print("Forwarding message to client {}\n", .{subscriber.id});
-
-                        // 构建 PUBLISH 包发送给订阅者
-                        try writer.startPacket(mqtt.Command.PUBLISH);
-
-                        // 写入 topic
-                        try writer.writeUTF8String(topic);
-
-                        // 写入 payload (逐字节写入)
-                        for (payload) |byte| {
-                            try writer.writeByte(byte);
+                        // 跳过发送者自己
+                        if (subscriber.id == client.id) {
+                            std.debug.print("Skipping sender client {}\n", .{client.id});
+                            continue;
                         }
 
-                        try writer.finishPacket();
-                        try writer.writeToStream(&subscriber.stream);
+                        std.debug.print("Forwarding message to client {}\n", .{subscriber.id});
+
+                        // 为每个订阅者创建新的 writer
+                        var subscriber_writer = try packet.Writer.init(self.allocator);
+                        defer self.allocator.destroy(subscriber_writer);
+
+                        // 构建 PUBLISH 包发送给订阅者
+                        try subscriber_writer.startPacket(mqtt.Command.PUBLISH);
+
+                        // 写入 topic
+                        try subscriber_writer.writeUTF8String(topic);
+
+                        // 写入 payload (逐字节写入)
+                        std.debug.print("Writing {} bytes of payload\n", .{payload.len});
+                        for (payload) |byte| {
+                            try subscriber_writer.writeByte(byte);
+                        }
+
+                        // 调试:打印 finishPacket 之前的内容
+                        std.debug.print("Before finishPacket ({} bytes): ", .{subscriber_writer.pos});
+                        for (subscriber_writer.buffer[0..@min(subscriber_writer.pos, 50)]) |b| {
+                            std.debug.print("{X:0>2} ", .{b});
+                        }
+                        std.debug.print("\n", .{});
+
+                        try subscriber_writer.finishPacket();
+
+                        // 调试:打印发送的包内容
+                        std.debug.print("After finishPacket ({} bytes): ", .{subscriber_writer.pos});
+                        for (subscriber_writer.buffer[0..subscriber_writer.pos]) |b| {
+                            std.debug.print("{X:0>2} ", .{b});
+                        }
+                        std.debug.print("\n", .{});
+
+                        try subscriber_writer.writeToStream(&subscriber.stream);
 
                         std.debug.print("Message forwarded to client {}\n", .{subscriber.id});
                     }
@@ -300,12 +333,45 @@ const MqttBroker = struct {
                 },
                 .UNSUBSCRIBE => {
                     std.debug.print("Client {} sent UNSUBSCRIBE\n", .{client.id});
+
+                    // 读取 packet ID
+                    const packet_id = try reader.readTwoBytes();
+                    std.debug.print("UNSUBSCRIBE packet_id: {}\n", .{packet_id});
+
+                    // 读取要取消订阅的主题
+                    const topic = try reader.readUTF8String(false) orelse {
+                        std.log.err("UNSUBSCRIBE packet missing topic", .{});
+                        break;
+                    };
+
+                    std.debug.print("Unsubscribing from topic: {s}\n", .{topic});
+
+                    // TODO: 实现从订阅树中移除客户端订阅
+                    // try self.subscriptions.unsubscribe(topic, client);
+
+                    // 发送 UNSUBACK
+                    try writer.startPacket(mqtt.Command.UNSUBACK);
+                    try writer.writeTwoBytes(packet_id);
+                    try writer.finishPacket();
+                    try writer.writeToStream(&client.stream);
+
+                    std.debug.print("Server sent UNSUBACK to Client {}\n", .{client.id});
+
+                    // 移动 reader 位置到末尾
+                    reader.pos = reader.length;
                 },
                 .PUBREC => {
                     std.debug.print("Client {} sent PUBREC\n", .{client.id});
                 },
                 .PINGREQ => {
                     std.debug.print("Client {} sent PINGREQ\n", .{client.id});
+
+                    // 发送 PINGRESP
+                    try writer.startPacket(mqtt.Command.PINGRESP);
+                    try writer.finishPacket();
+                    try writer.writeToStream(&client.stream);
+
+                    std.debug.print("Server sent PINGRESP to Client {}\n", .{client.id});
                 },
                 .DISCONNECT => {
                     std.debug.print("Client {} sent DISCONNECT\n", .{client.id});

@@ -279,8 +279,18 @@ pub const Writer = struct {
             const length_bytes = try encodeLengthBytes(content_length);
             const actual_length = std.mem.indexOfScalar(u8, &length_bytes, 0) orelse 4;
 
-            // Shift the content to make room for the actual length
-            std.mem.copyBackwards(u8, self.buffer[length_pos + actual_length ..], self.buffer[length_pos + 4 .. self.pos]);
+            // 计算需要移动的字节数
+            const bytes_to_move = self.pos - (length_pos + 4);
+
+            // 向前移动内容 (源在后,目标在前,使用 copyForwards/memmove)
+            if (actual_length < 4) {
+                // 需要向前移动内容压缩空间
+                const src_start = length_pos + 4;
+                const dst_start = length_pos + actual_length;
+
+                // 使用 std.mem.copyForwards 向前复制
+                std.mem.copyForwards(u8, self.buffer[dst_start .. dst_start + bytes_to_move], self.buffer[src_start .. src_start + bytes_to_move]);
+            }
 
             // Write the actual length
             @memcpy(self.buffer[length_pos..][0..actual_length], length_bytes[0..actual_length]);
