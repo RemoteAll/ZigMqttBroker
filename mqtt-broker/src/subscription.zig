@@ -4,7 +4,7 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const config = @import("config.zig");
 
-const debugPrint = if (config.ENABLE_VERBOSE_LOGGING) debugPrint else struct {
+const debugPrint = if (config.ENABLE_VERBOSE_LOGGING) std.debug.print else struct {
     fn print(comptime fmt: []const u8, args: anytype) void {
         _ = fmt;
         _ = args;
@@ -112,26 +112,57 @@ pub const SubscriptionTree = struct {
     };
 
     root: Node,
+    // 订阅缓存: 主题 -> 订阅者列表
+    cache: std.StringHashMap(ArrayList(*Client)),
+    cache_mutex: std.Thread.Mutex,
+    allocator: Allocator,
 
     pub fn init(allocator: Allocator) SubscriptionTree {
         return SubscriptionTree{
             .root = Node.init(allocator),
+            .cache = std.StringHashMap(ArrayList(*Client)).init(allocator),
+            .cache_mutex = .{},
+            .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *SubscriptionTree) void {
-        self.root.deinit_deep(self.root.children.allocator);
-    }
+        // 清理缓存
+        var cache_it = self.cache.iterator();
+        while (cache_it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.cache.deinit();
 
-    pub fn subscribe(self: *SubscriptionTree, topic: []const u8, client: *Client) !void {
-        const topic_levels = try parseTopicLevels(topic, self.root.children.allocator);
+        self.root.deinit_deep(self.allocator);
+    }
+    pub fn subscribe(self: *SubscriptionTree, topic_filter: []const u8, client: *Client) !void {
+        const topic_levels = try parseTopicLevels(topic_filter, self.root.children.allocator);
         debugPrint(">> subscribe() >> topic_levels: {any}\n", .{topic_levels});
         try self.root.subscribe(topic_levels, client);
+
+        // 使订阅缓存失效
+        self.invalidateCache(topic_filter);
 
         // 打印订阅树结构
         debugPrint("\n=== Subscription Tree After Subscribe ===\n", .{});
         self.root.printTree("", "ROOT");
         debugPrint("==========================================\n\n", .{});
+    }
+
+    /// 使缓存失效
+    fn invalidateCache(self: *SubscriptionTree, topic: []const u8) void {
+        self.cache_mutex.lock();
+        defer self.cache_mutex.unlock();
+
+        // 简单策略: 清空整个缓存
+        // 优化: 可以只清除相关主题的缓存
+        var cache_it = self.cache.iterator();
+        while (cache_it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.cache.clearRetainingCapacity();
+        _ = topic;
     }
 
     pub fn printTree(self: *const SubscriptionTree) void {
@@ -141,6 +172,28 @@ pub const SubscriptionTree = struct {
     }
 
     pub fn match(self: *SubscriptionTree, topic: []const u8, allocator: *Allocator) !ArrayList(*Client) {
+        // 尝试从缓存获取
+        self.cache_mutex.lock();
+        if (self.cache.get(topic)) |cached| {
+            // 缓存命中 - 复制列表返回
+            var result: ArrayList(*Client) = .{};
+            for (cached.items) |client| {
+                try result.append(allocator.*, client);
+            }
+            self.cache_mutex.unlock();
+
+            if (config.ENABLE_VERBOSE_LOGGING) {
+                debugPrint(">> match() >> Cache HIT for '{s}': {} clients\n", .{ topic, result.items.len });
+            }
+            return result;
+        }
+        self.cache_mutex.unlock();
+
+        // 缓存未命中 - 执行实际匹配
+        if (config.ENABLE_VERBOSE_LOGGING) {
+            debugPrint(">> match() >> Cache MISS for '{s}'\n", .{topic});
+        }
+
         var matched_clients: ArrayList(*Client) = .{};
         const topic_levels = try parseTopicLevels(topic, self.root.children.allocator);
         debugPrint(">> match() >> topic_levels for '{s}': {any}\n", .{ topic, topic_levels });
@@ -152,6 +205,20 @@ pub const SubscriptionTree = struct {
 
         try self.root.match(topic_levels, &matched_clients, allocator.*);
         debugPrint(">> match() >> matched {} clients\n", .{matched_clients.items.len});
+
+        // 将结果加入缓存
+        self.cache_mutex.lock();
+        defer self.cache_mutex.unlock();
+
+        var cached_list: ArrayList(*Client) = .{};
+        for (matched_clients.items) |client| {
+            try cached_list.append(self.allocator, client);
+        }
+
+        // 复制主题字符串
+        const topic_copy = try self.allocator.dupe(u8, topic);
+        try self.cache.put(topic_copy, cached_list);
+
         return matched_clients;
     }
 

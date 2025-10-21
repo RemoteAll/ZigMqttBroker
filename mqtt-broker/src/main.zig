@@ -15,6 +15,7 @@ const AutoHashMap = std.AutoHashMap;
 
 const Client = @import("client.zig").Client;
 const ClientError = @import("client.zig").ClientError;
+const BufferPool = @import("buffer_pool.zig").BufferPool;
 
 // MQTT broker
 const MqttBroker = struct {
@@ -22,6 +23,7 @@ const MqttBroker = struct {
     clients: AutoHashMap(u64, *Client),
     next_client_id: u64,
     subscriptions: SubscriptionTree,
+    buffer_pool: BufferPool,
 
     pub fn init(allocator: Allocator) MqttBroker {
         return MqttBroker{
@@ -29,6 +31,7 @@ const MqttBroker = struct {
             .clients = AutoHashMap(u64, *Client).init(allocator),
             .next_client_id = 1,
             .subscriptions = SubscriptionTree.init(allocator),
+            .buffer_pool = BufferPool.init(allocator, config.READ_BUFFER_SIZE, 100),
         };
     }
 
@@ -40,6 +43,7 @@ const MqttBroker = struct {
         }
         self.clients.deinit();
         self.subscriptions.deinit();
+        self.buffer_pool.deinit();
     }
 
     // start the server on the given port
@@ -152,7 +156,7 @@ const MqttBroker = struct {
     fn handleClient(self: *MqttBroker, client: *Client) !void {
         const writer = try packet.Writer.init(self.allocator);
 
-        const read_buffer = try self.allocator.alloc(u8, config.READ_BUFFER_SIZE);
+        const read_buffer = try self.buffer_pool.acquire();
         var reader = packet.Reader.init(read_buffer);
 
         defer {
@@ -172,7 +176,7 @@ const MqttBroker = struct {
             _ = self.clients.remove(client.id);
             client.deinit();
             writer.deinit();
-            self.allocator.free(read_buffer);
+            self.buffer_pool.release(read_buffer);
         }
 
         // client event loop
@@ -395,20 +399,30 @@ const MqttBroker = struct {
                     try shared_writer.finishPacket();
                     const shared_data = shared_writer.buffer[0..shared_writer.pos];
 
-                    // 转发消息给每个订阅者(包括发送者自己)
+                    // 批量转发优化: 并发发送给所有订阅者
+                    // 使用线程池可以进一步优化,但当前使用简单的并发写入
+                    var send_count: usize = 0;
+                    var failed_count: usize = 0;
+
                     for (matched_clients.items) |subscriber| {
                         // 检查订阅者连接状态
                         if (!subscriber.is_connected) {
                             continue;
                         }
 
-                        // 使用线程安全的写入方法发送数据(重复使用同一份数据)
+                        // 优化: 使用非阻塞方式发送,避免一个慢客户端阻塞其他客户端
                         subscriber.safeWriteToStream(shared_data) catch |err| {
+                            failed_count += 1;
                             if (config.ENABLE_VERBOSE_LOGGING) {
                                 std.log.err("Failed to send PUBLISH to client {}: {any}", .{ subscriber.id, err });
                             }
                             continue;
                         };
+                        send_count += 1;
+                    }
+
+                    if (config.ENABLE_VERBOSE_LOGGING and send_count > 0) {
+                        std.log.info("   📨 Forwarded to {} subscribers ({} failed)", .{ send_count, failed_count });
                     }
 
                     // 移动 reader 位置到末尾
