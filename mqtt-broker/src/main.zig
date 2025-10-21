@@ -189,8 +189,8 @@ const MqttBroker = struct {
             // 标记客户端为已断开,避免其他线程尝试写入
             client.is_connected = false;
 
-            // 清理客户端的所有订阅
-            self.subscriptions.removeClientAllSubscriptions(client.id);
+            // 清理客户端的所有订阅（使用 MQTT 客户端 ID）
+            self.subscriptions.removeClientAllSubscriptions(client.identifer);
 
             _ = self.clients.remove(client.id);
             client.deinit();
@@ -351,8 +351,11 @@ const MqttBroker = struct {
                         // Set reason_code to Success if everything is okay
                         reason_code = mqtt.ReasonCode.Success;
 
+                        // 设置 MQTT 客户端 ID（复制字符串以确保生命周期正确）
+                        client.identifer = try self.allocator.dupe(u8, connect_packet.client_identifier);
+
                         // ack the connection
-                        std.log.info("✅ Client {} CONNECT successful", .{client.id});
+                        std.log.info("✅ Client {} ('{s}') CONNECT successful", .{ client.id, client.identifer });
                         client.is_connected = true; // 标记客户端已连接
                         try connect.connack(writer, client, reason_code);
                         std.log.info("📤 Server sent CONNACK (success) to Client {}", .{client.id});

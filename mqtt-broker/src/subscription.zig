@@ -28,16 +28,17 @@ pub const SubscriptionTree = struct {
             debugPrint(">> Node.subscribe() >> topic_levels.len={}\n", .{topic_levels.len});
 
             if (topic_levels.len == 0) {
-                // 检查是否已订阅（去重）- 反向遍历，新订阅通常在末尾
+                // 检查是否已订阅（去重）- 使用 MQTT 客户端 ID 而不是连接 ID
+                // 反向遍历，新订阅通常在末尾
                 var i: usize = self.subscribers.items.len;
                 while (i > 0) {
                     i -= 1;
-                    if (self.subscribers.items[i].id == client.id) {
-                        debugPrint(">> Client {} already subscribed, skipping\n", .{client.id});
+                    if (std.mem.eql(u8, self.subscribers.items[i].identifer, client.identifer)) {
+                        debugPrint(">> Client '{s}' (conn_id: {}) already subscribed, skipping\n", .{ client.identifer, client.id });
                         return;
                     }
                 }
-                debugPrint(">> Adding client {} as subscriber (total: {})\n", .{ client.id, self.subscribers.items.len + 1 });
+                debugPrint(">> Adding client '{s}' (conn_id: {}) as subscriber (total: {})\n", .{ client.identifer, client.id, self.subscribers.items.len + 1 });
                 try self.subscribers.append(self.children.allocator, client);
                 return;
             }
@@ -62,17 +63,17 @@ pub const SubscriptionTree = struct {
             debugPrint(">> Node.unsubscribe() >> topic_levels.len={}\n", .{topic_levels.len});
 
             if (topic_levels.len == 0) {
-                // 查找并移除客户端
+                // 查找并移除客户端（使用 MQTT 客户端 ID）
                 var i: usize = 0;
                 while (i < self.subscribers.items.len) {
-                    if (self.subscribers.items[i].id == client.id) {
+                    if (std.mem.eql(u8, self.subscribers.items[i].identifer, client.identifer)) {
                         _ = self.subscribers.swapRemove(i);
-                        debugPrint(">> Removed client {} from subscribers (remaining: {})\n", .{ client.id, self.subscribers.items.len });
+                        debugPrint(">> Removed client '{s}' (conn_id: {}) from subscribers (remaining: {})\n", .{ client.identifer, client.id, self.subscribers.items.len });
                         return true;
                     }
                     i += 1;
                 }
-                debugPrint(">> Client {} not found in subscribers\n", .{client.id});
+                debugPrint(">> Client '{s}' (conn_id: {}) not found in subscribers\n", .{ client.identifer, client.id });
                 return false;
             }
 
@@ -88,13 +89,16 @@ pub const SubscriptionTree = struct {
             }
         }
 
-        pub fn removeClient(self: *Node, client_id: u64) void {
-            // 从当前节点移除客户端
+        pub fn removeClient(self: *Node, client_identifer: []const u8) void {
+            // 从当前节点移除客户端（使用 MQTT 客户端 ID）
+            // 注意：使用 swapRemove 后不要增加索引，因为末尾元素会移动到当前位置
             var i: usize = 0;
             while (i < self.subscribers.items.len) {
-                if (self.subscribers.items[i].id == client_id) {
+                if (std.mem.eql(u8, self.subscribers.items[i].identifer, client_identifer)) {
+                    const conn_id = self.subscribers.items[i].id;
                     _ = self.subscribers.swapRemove(i);
-                    debugPrint(">> Removed disconnected client {} from node\n", .{client_id});
+                    debugPrint(">> Removed disconnected client '{s}' (conn_id: {}) from node\n", .{ client_identifer, conn_id });
+                    // 不增加 i，因为需要检查刚刚移动过来的元素
                 } else {
                     i += 1;
                 }
@@ -103,7 +107,7 @@ pub const SubscriptionTree = struct {
             // 递归处理所有子节点
             var it = self.children.iterator();
             while (it.next()) |entry| {
-                entry.value_ptr.removeClient(client_id);
+                entry.value_ptr.removeClient(client_identifer);
             }
         }
 
@@ -134,7 +138,10 @@ pub const SubscriptionTree = struct {
             if (self.children.getPtr("#")) |child| {
                 debugPrint(">> Found '#' wildcard, adding {} subscribers\n", .{child.subscribers.items.len});
                 for (child.subscribers.items) |client| {
-                    try matched_clients.append(allocator, client);
+                    // 只添加仍然连接的客户端
+                    if (client.is_connected) {
+                        try matched_clients.append(allocator, client);
+                    }
                 }
             }
 
@@ -230,11 +237,11 @@ pub const SubscriptionTree = struct {
         return result;
     }
 
-    /// 移除客户端的所有订阅（客户端断开连接时调用）
-    pub fn removeClientAllSubscriptions(self: *SubscriptionTree, client_id: u64) void {
-        debugPrint(">> removeClientAllSubscriptions() >> client_id: {}\n", .{client_id});
+    /// 移除客户端的所有订阅（客户端断开连接时调用，使用 MQTT 客户端 ID）
+    pub fn removeClientAllSubscriptions(self: *SubscriptionTree, client_identifer: []const u8) void {
+        debugPrint(">> removeClientAllSubscriptions() >> client_identifer: '{s}'\n", .{client_identifer});
 
-        self.root.removeClient(client_id);
+        self.root.removeClient(client_identifer);
 
         // 清空整个缓存，因为订阅关系改变了
         self.cache_mutex.lock();
@@ -247,7 +254,7 @@ pub const SubscriptionTree = struct {
         }
         self.cache.clearRetainingCapacity();
 
-        debugPrint(">> All subscriptions and cache cleared for client {}\n", .{client_id});
+        debugPrint(">> All subscriptions and cache cleared for client '{s}'\n", .{client_identifer});
     }
 
     /// 使缓存失效

@@ -103,7 +103,7 @@ pub const Client = struct {
         client.* = .{
             .allocator = allocator,
             .id = id,
-            .identifer = undefined,
+            .identifer = &.{}, // 初始化为空字符串，稍后由 CONNECT 包设置
             .protocol_version = protocol_version,
             .stream = stream,
             .address = address,
@@ -152,7 +152,10 @@ pub const Client = struct {
         if (self.password) |password| self.allocator.free(password);
         if (self.will_topic) |topic| self.allocator.free(topic);
         if (self.will_payload) |payload| self.allocator.free(payload);
-        // self.allocator.free(self.identifer);
+        // 释放 MQTT 客户端 ID（仅当长度 > 0 时，避免释放未初始化的内存）
+        if (self.identifer.len > 0) {
+            self.allocator.free(self.identifer);
+        }
         self.subscriptions.deinit(self.allocator);
         self.incoming_queue.deinit(self.allocator);
         self.outgoing_queue.deinit(self.allocator);
