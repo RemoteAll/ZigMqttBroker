@@ -34,7 +34,9 @@ const SubackReturnCode = enum(u8) {
 pub fn read(reader: *packet.Reader, client: *Client, allocator: Allocator) !*SubscribePacket {
     const packet_id = try reader.readTwoBytes();
 
-    var sp = SubscribePacket.init(allocator, packet_id);
+    // 在堆上分配 SubscribePacket
+    const sp = try allocator.create(SubscribePacket);
+    sp.* = SubscribePacket.init(allocator, packet_id);
     sp.subscription_identifier = null;
     // todo - complete  createing the subscprtion packet
 
@@ -72,7 +74,7 @@ pub fn read(reader: *packet.Reader, client: *Client, allocator: Allocator) !*Sub
     // };
     // try client.addSubscription(subscription);
 
-    return &sp;
+    return sp;
 }
 
 pub fn suback(writer: *packet.Writer, stream: *net.Stream, packet_id: u16, client: *Client) !void {

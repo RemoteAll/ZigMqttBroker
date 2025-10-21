@@ -83,34 +83,72 @@ const MqttBroker = struct {
             self.allocator.free(read_buffer);
         }
 
-        std.debug.print("Client {any} is connecting\n", .{client.address});
-        std.debug.print("Stream handle: {any}\n", .{client.stream.handle});
+        std.debug.print("=== Client {} connected from {any} ===\n", .{ client.id, client.address });
         std.debug.print("Read buffer size: {}\n", .{read_buffer.len});
-
-        // 短暂延迟，让客户端有时间准备
-        std.Thread.sleep(10 * std.time.ns_per_ms);
 
         // client event loop
         while (true) {
-            std.debug.print("Attempting to read from client {}...\n", .{client.id});
-            const length = client.stream.read(read_buffer) catch |err| {
-                // 优雅处理连接关闭和网络错误
-                switch (err) {
-                    error.ConnectionResetByPeer, error.BrokenPipe, error.Unexpected => {
-                        std.log.info("Client {} connection closed: {any}", .{ client.id, err });
-                        return;
-                    },
-                    else => {
-                        std.log.err("Error reading from client {}: {any}", .{ client.id, err });
-                        return;
-                    },
+            std.debug.print("\n[Client {}] Waiting to read data...\n", .{client.id});
+
+            // 使用更底层的 recv 来读取 socket 数据
+            const length = blk: {
+                if (@import("builtin").os.tag == .windows) {
+                    // Windows 平台使用 recv
+                    const windows = std.os.windows;
+                    const ws2_32 = windows.ws2_32;
+                    const result = ws2_32.recv(client.stream.handle, read_buffer.ptr, @intCast(read_buffer.len), 0);
+                    if (result == ws2_32.SOCKET_ERROR) {
+                        const err = ws2_32.WSAGetLastError();
+                        std.debug.print("[Client {}] Windows socket error code: {}\n", .{ client.id, err });
+                        if (err == .WSAECONNRESET or err == .WSAECONNABORTED) {
+                            std.log.info("Client {} connection closed by peer", .{client.id});
+                            return;
+                        }
+                        std.log.err("Client {} socket error: {any}", .{ client.id, err });
+                        return ClientError.ClientReadError;
+                    }
+                    break :blk @as(usize, @intCast(result));
+                } else {
+                    // Unix/Linux 平台使用标准 read
+                    break :blk client.stream.read(read_buffer) catch |err| {
+                        std.debug.print("[Client {}] Read error: {any}\n", .{ client.id, err });
+                        switch (err) {
+                            error.ConnectionResetByPeer, error.BrokenPipe => {
+                                std.log.info("Client {} connection closed: {any}", .{ client.id, err });
+                                return;
+                            },
+                            else => {
+                                std.log.err("Error reading from client {}: {any}", .{ client.id, err });
+                                return ClientError.ClientReadError;
+                            },
+                        }
+                    };
                 }
             };
+
+            std.debug.print("[Client {}] Read {} bytes\n", .{ client.id, length });
 
             if (length == 0) {
                 std.log.info("Client {} sent 0 length packet, disconnected", .{client.id});
                 return;
             }
+
+            // 打印接收到的原始数据（十六进制和ASCII）
+            std.debug.print("[Client {}] Raw data (hex): ", .{client.id});
+            for (read_buffer[0..length]) |byte| {
+                std.debug.print("{X:0>2} ", .{byte});
+            }
+            std.debug.print("\n", .{});
+
+            std.debug.print("[Client {}] Raw data (ASCII): ", .{client.id});
+            for (read_buffer[0..length]) |byte| {
+                if (byte >= 32 and byte <= 126) {
+                    std.debug.print("{c}", .{byte});
+                } else {
+                    std.debug.print(".", .{});
+                }
+            }
+            std.debug.print("\n", .{});
 
             reader.start(length) catch |err| {
                 std.log.err("Error starting reader: {any}", .{err});
@@ -193,8 +231,13 @@ const MqttBroker = struct {
                 },
                 .SUBSCRIBE => {
                     const subscribe_packet = try subscribe.read(reader, client, self.allocator);
+                    defer {
+                        subscribe_packet.deinit(self.allocator);
+                        self.allocator.destroy(subscribe_packet);
+                    }
 
-                    std.debug.print("Subscribe packet: {any}\n", .{subscribe_packet});
+                    // std.debug.print("Subscribe packet: {any}\n", .{subscribe_packet});
+                    std.debug.print("Processing SUBSCRIBE with packet_id: {}\n", .{subscribe_packet.packet_id});
                     for (subscribe_packet.topics.items) |topic| {
                         try self.subscriptions.subscribe(topic.filter, client);
                         std.debug.print("Client {} subscribed to topic {s}\n", .{ client.id, topic.filter });
@@ -209,6 +252,14 @@ const MqttBroker = struct {
                 },
                 .PUBLISH => {
                     std.debug.print("Client {} sent PUBLISH\n", .{client.id});
+                    // TODO: 完整实现 PUBLISH 处理逻辑
+                    // 目前只是跳过包内容以避免解析错误
+                    const start_pos = reader.pos;
+                    const remaining = reader.length - start_pos;
+                    if (remaining > 0) {
+                        std.debug.print("Skipping {} bytes of PUBLISH payload\n", .{remaining});
+                        reader.pos = reader.length; // 跳到 buffer 末尾
+                    }
                 },
                 .UNSUBSCRIBE => {
                     std.debug.print("Client {} sent UNSUBSCRIBE\n", .{client.id});
