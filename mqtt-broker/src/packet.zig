@@ -319,7 +319,7 @@ pub const Writer = struct {
             return PacketWriterError.BufferTooSmall;
         }
         try self.writeTwoBytes(@intCast(string.len));
-        std.mem.copy(u8, self.buffer[self.pos..], string);
+        @memcpy(self.buffer[self.pos..][0..string.len], string);
         self.pos += string.len;
     }
 

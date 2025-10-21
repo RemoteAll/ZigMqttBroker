@@ -252,14 +252,51 @@ const MqttBroker = struct {
                 },
                 .PUBLISH => {
                     std.debug.print("Client {} sent PUBLISH\n", .{client.id});
-                    // TODO: 完整实现 PUBLISH 处理逻辑
-                    // 目前只是跳过包内容以避免解析错误
-                    const start_pos = reader.pos;
-                    const remaining = reader.length - start_pos;
-                    if (remaining > 0) {
-                        std.debug.print("Skipping {} bytes of PUBLISH payload\n", .{remaining});
-                        reader.pos = reader.length; // 跳到 buffer 末尾
+
+                    // 读取 topic
+                    const topic = try reader.readUTF8String(false) orelse {
+                        std.log.err("PUBLISH packet missing topic", .{});
+                        break;
+                    };
+
+                    std.debug.print("PUBLISH topic: {s}\n", .{topic});
+
+                    // 计算 payload 的长度
+                    const payload_start = reader.pos;
+                    const payload_length = reader.length - payload_start;
+                    const payload = reader.buffer[payload_start..reader.length];
+
+                    std.debug.print("PUBLISH payload ({} bytes): {s}\n", .{ payload_length, payload });
+
+                    // 查找匹配的订阅者
+                    var matched_clients = try self.subscriptions.match(topic, &self.allocator);
+                    defer matched_clients.deinit(self.allocator);
+
+                    std.debug.print("Found {} matching subscribers\n", .{matched_clients.items.len});
+
+                    // 转发消息给每个订阅者
+                    for (matched_clients.items) |subscriber| {
+                        std.debug.print("Forwarding message to client {}\n", .{subscriber.id});
+
+                        // 构建 PUBLISH 包发送给订阅者
+                        try writer.startPacket(mqtt.Command.PUBLISH);
+
+                        // 写入 topic
+                        try writer.writeUTF8String(topic);
+
+                        // 写入 payload (逐字节写入)
+                        for (payload) |byte| {
+                            try writer.writeByte(byte);
+                        }
+
+                        try writer.finishPacket();
+                        try writer.writeToStream(&subscriber.stream);
+
+                        std.debug.print("Message forwarded to client {}\n", .{subscriber.id});
                     }
+
+                    // 移动 reader 位置到末尾
+                    reader.pos = reader.length;
                 },
                 .UNSUBSCRIBE => {
                     std.debug.print("Client {} sent UNSUBSCRIBE\n", .{client.id});
