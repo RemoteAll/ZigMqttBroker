@@ -11,7 +11,7 @@ const Client = @import("client.zig").Client;
 const isValidClientId = @import("client.zig").isValidClientId;
 
 // 日志宏 - 根据配置决定是否打印
-const debugPrint = if (config.ENABLE_VERBOSE_LOGGING) debugPrint else struct {
+const debugPrint = if (config.ENABLE_VERBOSE_LOGGING) std.debug.print else struct {
     fn print(comptime fmt: []const u8, args: anytype) void {
         _ = fmt;
         _ = args;

@@ -9,7 +9,7 @@ const SubscribePacket = @import("mqtt/subscribe_packet.zig").SubscribePacket;
 const assert = std.debug.assert;
 const config = @import("config.zig");
 
-const debugPrint = if (config.ENABLE_VERBOSE_LOGGING) debugPrint else struct {
+const debugPrint = if (config.ENABLE_VERBOSE_LOGGING) std.debug.print else struct {
     fn print(comptime fmt: []const u8, args: anytype) void {
         _ = fmt;
         _ = args;

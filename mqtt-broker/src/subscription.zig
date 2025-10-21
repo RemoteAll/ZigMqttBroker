@@ -28,6 +28,13 @@ pub const SubscriptionTree = struct {
             debugPrint(">> Node.subscribe() >> topic_levels.len={}\n", .{topic_levels.len});
 
             if (topic_levels.len == 0) {
+                // 检查是否已订阅（去重）
+                for (self.subscribers.items) |existing_client| {
+                    if (existing_client.id == client.id) {
+                        debugPrint(">> Client {} already subscribed, skipping\n", .{client.id});
+                        return;
+                    }
+                }
                 debugPrint(">> Adding client {} as subscriber (total: {})\n", .{ client.id, self.subscribers.items.len + 1 });
                 try self.subscribers.append(self.children.allocator, client);
                 return;
@@ -47,6 +54,36 @@ pub const SubscriptionTree = struct {
                 debugPrint(">> Found existing child node for '{s}'\n", .{current_level});
             }
             try child.value_ptr.subscribe(topic_levels[1..], client);
+        }
+
+        pub fn unsubscribe(self: *Node, topic_levels: [][]const u8, client: *Client) bool {
+            debugPrint(">> Node.unsubscribe() >> topic_levels.len={}\n", .{topic_levels.len});
+
+            if (topic_levels.len == 0) {
+                // 查找并移除客户端
+                var i: usize = 0;
+                while (i < self.subscribers.items.len) {
+                    if (self.subscribers.items[i].id == client.id) {
+                        _ = self.subscribers.swapRemove(i);
+                        debugPrint(">> Removed client {} from subscribers (remaining: {})\n", .{ client.id, self.subscribers.items.len });
+                        return true;
+                    }
+                    i += 1;
+                }
+                debugPrint(">> Client {} not found in subscribers\n", .{client.id});
+                return false;
+            }
+
+            const current_level = topic_levels[0];
+            debugPrint(">> Looking for child node: '{s}'\n", .{current_level});
+
+            if (self.children.getPtr(current_level)) |child| {
+                debugPrint(">> Found child node for '{s}'\n", .{current_level});
+                return child.unsubscribe(topic_levels[1..], client);
+            } else {
+                debugPrint(">> No child node found for '{s}'\n", .{current_level});
+                return false;
+            }
         }
 
         pub fn match(self: *Node, topic_levels: [][]const u8, matched_clients: *ArrayList(*Client), allocator: Allocator) !void {
@@ -150,19 +187,48 @@ pub const SubscriptionTree = struct {
         debugPrint("==========================================\n\n", .{});
     }
 
+    pub fn unsubscribe(self: *SubscriptionTree, topic_filter: []const u8, client: *Client) !bool {
+        const topic_levels = try parseTopicLevels(topic_filter, self.root.children.allocator);
+        debugPrint(">> unsubscribe() >> topic_filter: '{s}', topic_levels: {any}\n", .{ topic_filter, topic_levels });
+
+        const result = self.root.unsubscribe(topic_levels, client);
+
+        if (result) {
+            // 使订阅缓存失效
+            self.invalidateCache(topic_filter);
+
+            // 打印订阅树结构
+            debugPrint("\n=== Subscription Tree After Unsubscribe ===\n", .{});
+            self.root.printTree("", "ROOT");
+            debugPrint("============================================\n\n", .{});
+        }
+
+        return result;
+    }
+
     /// 使缓存失效
     fn invalidateCache(self: *SubscriptionTree, topic: []const u8) void {
         self.cache_mutex.lock();
         defer self.cache_mutex.unlock();
 
-        // 简单策略: 清空整个缓存
-        // 优化: 可以只清除相关主题的缓存
-        var cache_it = self.cache.iterator();
-        while (cache_it.next()) |entry| {
-            entry.value_ptr.deinit(self.allocator);
+        // 策略1: 尝试精确清除指定主题的缓存
+        if (self.cache.fetchRemove(topic)) |entry| {
+            debugPrint(">> Invalidating cache for exact topic: '{s}'\n", .{topic});
+            var list = entry.value;
+            list.deinit(self.allocator);
+            self.allocator.free(entry.key);
         }
-        self.cache.clearRetainingCapacity();
-        _ = topic;
+
+        // 策略2: 如果主题包含通配符，清空整个缓存（因为可能影响多个缓存条目）
+        if (std.mem.indexOf(u8, topic, "+") != null or std.mem.indexOf(u8, topic, "#") != null) {
+            debugPrint(">> Topic contains wildcards, clearing entire cache\n", .{});
+            var cache_it = self.cache.iterator();
+            while (cache_it.next()) |entry| {
+                entry.value_ptr.deinit(self.allocator);
+                self.allocator.free(entry.key_ptr.*);
+            }
+            self.cache.clearRetainingCapacity();
+        }
     }
 
     pub fn printTree(self: *const SubscriptionTree) void {

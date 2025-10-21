@@ -446,13 +446,18 @@ const MqttBroker = struct {
                     const packet_id = try reader.readTwoBytes();
 
                     // 读取要取消订阅的主题
-                    _ = try reader.readUTF8String(false) orelse {
+                    const topic = try reader.readUTF8String(false) orelse {
                         std.log.err("UNSUBSCRIBE packet missing topic", .{});
                         break;
                     };
 
-                    // TODO: 实现从订阅树中移除客户端订阅
-                    // try self.subscriptions.unsubscribe(topic, client);
+                    // 从订阅树中移除客户端订阅
+                    const unsubscribed = try self.subscriptions.unsubscribe(topic, client);
+                    if (unsubscribed) {
+                        std.log.info("Client {} unsubscribed from topic: {s}", .{ client.id, topic });
+                    } else {
+                        std.log.warn("Client {} tried to unsubscribe from non-subscribed topic: {s}", .{ client.id, topic });
+                    }
 
                     // 发送 UNSUBACK
                     try writer.startPacket(mqtt.Command.UNSUBACK);

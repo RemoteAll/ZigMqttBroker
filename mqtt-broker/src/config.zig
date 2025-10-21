@@ -8,5 +8,5 @@ pub const READ_BUFFER_SIZE = 1024;
 pub const WRITE_BUFFER_SIZE = 1024;
 
 // 性能优化配置
-pub const ENABLE_VERBOSE_LOGGING = false; // 关闭详细日志以提高性能
-pub const ENABLE_HEX_DUMP = false; // 关闭十六进制转储
+pub const ENABLE_VERBOSE_LOGGING = true; // 关闭详细日志以提高性能
+pub const ENABLE_HEX_DUMP = true; // 关闭十六进制转储
