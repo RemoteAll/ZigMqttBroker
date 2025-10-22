@@ -180,17 +180,20 @@ const MqttBroker = struct {
                 std.log.info("\n╔════════════════════════════════════════════════╗", .{});
                 std.log.info("║ 🔌 CLIENT DISCONNECTED", .{});
                 std.log.info("╠════════════════════════════════════════════════╣", .{});
-                std.log.info("║ Client ID: {}", .{client.id});
+                std.log.info("║ Client ID: {} ('{s}')", .{ client.id, client.identifer });
                 std.log.info("╚════════════════════════════════════════════════╝\n", .{});
             } else {
-                std.log.info("Client {} disconnected", .{client.id});
+                std.log.info("Client {} ('{s}') disconnected", .{ client.id, client.identifer });
             }
 
             // 标记客户端为已断开,避免其他线程尝试写入
             client.is_connected = false;
 
             // 清理客户端的所有订阅（使用 MQTT 客户端 ID）
-            self.subscriptions.removeClientAllSubscriptions(client.identifer);
+            if (client.identifer.len > 0) {
+                std.log.info("🧹 Cleaning up subscriptions for client '{s}'", .{client.identifer});
+                self.subscriptions.removeClientAllSubscriptions(client.identifer);
+            }
 
             _ = self.clients.remove(client.id);
             client.deinit();
@@ -211,10 +214,10 @@ const MqttBroker = struct {
                     if (result == ws2_32.SOCKET_ERROR) {
                         const err = ws2_32.WSAGetLastError();
                         if (err == .WSAECONNRESET or err == .WSAECONNABORTED) {
-                            std.log.info("⚠️  Client {} connection closed by peer", .{client.id});
+                            std.log.info("⚠️  Client {} ('{s}') connection closed by peer: {any}", .{ client.id, client.identifer, err });
                             return;
                         }
-                        std.log.err("❌ Client {} socket error: {any}", .{ client.id, err });
+                        std.log.err("❌ Client {} ('{s}') socket error: {any}", .{ client.id, client.identifer, err });
                         return ClientError.ClientReadError;
                     }
                     break :blk @as(usize, @intCast(result));
@@ -223,11 +226,11 @@ const MqttBroker = struct {
                     break :blk client.stream.read(read_buffer) catch |err| {
                         switch (err) {
                             error.ConnectionResetByPeer, error.BrokenPipe => {
-                                std.log.info("⚠️  Client {} connection closed: {any}", .{ client.id, err });
+                                std.log.info("⚠️  Client {} ('{s}') connection closed: {any}", .{ client.id, client.identifer, err });
                                 return;
                             },
                             else => {
-                                std.log.err("❌ Error reading from client {}: {any}", .{ client.id, err });
+                                std.log.err("❌ Error reading from client {} ('{s}'): {any}", .{ client.id, client.identifer, err });
                                 return ClientError.ClientReadError;
                             },
                         }
@@ -236,7 +239,7 @@ const MqttBroker = struct {
             };
 
             if (length == 0) {
-                std.log.info("Client {} sent 0 length packet, disconnected", .{client.id});
+                std.log.info("📭 Client {} ('{s}') sent 0 length packet, closing connection", .{ client.id, client.identifer });
                 return;
             }
 
