@@ -33,6 +33,7 @@ pub const SubscriptionTree = struct {
         }
 
         pub fn match(self: *Node, topic_levels: [][]const u8, matched_clients: *ArrayList(*Client), allocator: Allocator) !void {
+            // 如果没有更多层级，收集当前节点的订阅者
             if (topic_levels.len == 0) {
                 for (self.subscribers.items) |client| {
                     try matched_clients.append(allocator, client);
@@ -40,6 +41,20 @@ pub const SubscriptionTree = struct {
                 return;
             }
 
+            // 1. 处理多级通配符 '#' (匹配所有剩余层级)
+            if (self.children.get("#")) |wildcard_child| {
+                // '#' 匹配当前层级和所有子层级，直接收集订阅者
+                for (wildcard_child.subscribers.items) |client| {
+                    try matched_clients.append(allocator, client);
+                }
+            }
+
+            // 2. 处理单级通配符 '+' (只匹配当前层级)
+            if (self.children.get("+")) |plus_child| {
+                try plus_child.match(topic_levels[1..], matched_clients, allocator);
+            }
+
+            // 3. 精确匹配当前层级
             if (self.children.get(topic_levels[0])) |child| {
                 try child.match(topic_levels[1..], matched_clients, allocator);
             }
@@ -67,6 +82,9 @@ pub const SubscriptionTree = struct {
     }
 
     pub fn subscribe(self: *SubscriptionTree, topic: []const u8, client: *Client) !void {
+        // 验证主题过滤器格式
+        try validateTopicFilter(topic);
+
         const topic_levels = try parseTopicLevels(topic, self.root.children.allocator);
         std.debug.print(">> subscribe() >> topic_levels: {any}\n", .{topic_levels});
         try self.root.subscribe(topic_levels, client, self.root.children.allocator);
@@ -101,6 +119,8 @@ pub const SubscriptionTree = struct {
         // ✅ "a/b/c" -> ["a", "b", "c"]
         // ✅ "/a/b"  -> ["", "a", "b"]
         // ✅ "a/b/"  -> ["a", "b", ""] (尾部空层级也保留)
+        // ✅ "sport/#" -> ["sport", "#"] (多级通配符)
+        // ✅ "sport/+/player1" -> ["sport", "+", "player1"] (单级通配符)
 
         var iterator = std.mem.splitScalar(u8, topic, '/');
         while (iterator.next()) |level| {
@@ -108,5 +128,49 @@ pub const SubscriptionTree = struct {
         }
 
         return topic_levels.toOwnedSlice(allocator);
+    }
+
+    /// 验证主题过滤器是否符合 MQTT 规范
+    /// [MQTT-4.7.1-1] 通配符字符可以用在主题过滤器中，但不能用在主题名称中
+    /// [MQTT-4.7.1-2] 多级通配符必须单独使用或跟在主题层级分隔符后面，且必须是最后一个字符
+    /// [MQTT-4.7.1-3] 单级通配符必须占据整个层级
+    fn validateTopicFilter(topic: []const u8) !void {
+        if (topic.len == 0) {
+            return error.InvalidTopicFilter;
+        }
+
+        var i: usize = 0;
+        while (i < topic.len) : (i += 1) {
+            const c = topic[i];
+
+            // 检查多级通配符 '#'
+            if (c == '#') {
+                // [MQTT-4.7.1-2] '#' 必须是最后一个字符
+                if (i != topic.len - 1) {
+                    std.debug.print("ERROR: Multi-level wildcard '#' must be the last character\n", .{});
+                    return error.InvalidTopicFilter;
+                }
+                // '#' 必须是单独的层级或在 '/' 之后
+                if (i > 0 and topic[i - 1] != '/') {
+                    std.debug.print("ERROR: Multi-level wildcard '#' must occupy an entire level\n", .{});
+                    return error.InvalidTopicFilter;
+                }
+            }
+
+            // 检查单级通配符 '+'
+            if (c == '+') {
+                // [MQTT-4.7.1-3] '+' 必须占据整个层级
+                // 检查前面的字符
+                if (i > 0 and topic[i - 1] != '/') {
+                    std.debug.print("ERROR: Single-level wildcard '+' must occupy an entire level\n", .{});
+                    return error.InvalidTopicFilter;
+                }
+                // 检查后面的字符
+                if (i + 1 < topic.len and topic[i + 1] != '/') {
+                    std.debug.print("ERROR: Single-level wildcard '+' must occupy an entire level\n", .{});
+                    return error.InvalidTopicFilter;
+                }
+            }
+        }
     }
 };
