@@ -208,7 +208,11 @@ pub const Client = struct {
         } else {
             std.debug.print("Client ID (MQTT): <not set>\n", .{});
         }
-        std.debug.print("Protocol Version: {any}\n", .{self.protocol_version});
+        if (self.protocol_version) |pv| {
+            std.debug.print("Protocol Version: {s}\n", .{pv.toString()});
+        } else {
+            std.debug.print("Protocol Version: <not set>\n", .{});
+        }
         std.debug.print("Address: {any}\n", .{self.address});
         std.debug.print("Is Connected: {any}\n", .{self.is_connected});
         std.debug.print("Connect Time: {}\n", .{self.connect_time});
