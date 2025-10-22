@@ -34,14 +34,27 @@ const SubackReturnCode = enum(u8) {
 pub fn read(reader: *packet.Reader, client: *Client, allocator: Allocator) !*SubscribePacket {
     const packet_id = try reader.readTwoBytes();
 
-    var sp = SubscribePacket.init(allocator, packet_id);
+    // 在堆上分配 SubscribePacket，而不是栈上
+    const sp = try allocator.create(SubscribePacket);
+    errdefer allocator.destroy(sp);
+
+    sp.* = SubscribePacket.init(allocator, packet_id);
+    errdefer sp.deinit(allocator);
+
     sp.subscription_identifier = null;
     // todo - complete  createing the subscprtion packet
 
-    const topic_filter = try reader.readUTF8String(false) orelse "";
+    const topic_filter = try reader.readUTF8String(false) orelse {
+        std.debug.print("ERROR: Topic filter is null or empty\n", .{});
+        return SubscribeError.TopicMustBePresent;
+    };
+
     if (topic_filter.len == 0) {
+        std.debug.print("ERROR: Topic filter length is 0\n", .{});
         return SubscribeError.TopicMustBePresent;
     }
+
+    std.debug.print("DEBUG: Subscribing to topic: '{s}' (length: {d})\n", .{ topic_filter, topic_filter.len });
 
     // The upper 6 bits of the Requested QoS byte are not used in the current version of the protocol.
     // They are reserved for future use.
@@ -72,7 +85,7 @@ pub fn read(reader: *packet.Reader, client: *Client, allocator: Allocator) !*Sub
     // };
     // try client.addSubscription(subscription);
 
-    return &sp;
+    return sp;
 }
 
 pub fn suback(writer: *packet.Writer, stream: *net.Stream, packet_id: u16, client: *Client) (packet.PacketWriterError || SubscribeError || posix.WriteError)!void {

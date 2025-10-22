@@ -80,18 +80,33 @@ pub const SubscriptionTree = struct {
     }
 
     fn parseTopicLevels(topic: []const u8, allocator: Allocator) ![][]const u8 {
+        // 防止空字符串导致段错误
+        if (topic.len == 0) {
+            std.debug.print("WARNING: parseTopicLevels received empty topic\n", .{});
+            return &[_][]const u8{};
+        }
+
         var topic_levels: ArrayList([]const u8) = .{};
 
-        var iterator = std.mem.splitSequence(u8, topic, "/");
+        // MQTT 规范说明：
+        // - 使用 splitScalar 而不是 tokenizeScalar，以保留空层级
+        // - 根据 MQTT 规范，"/test" 和 "test" 是不同的主题：
+        //   - "/test" 解析为 ["", "test"] (有一个空的根层级)
+        //   - "test" 解析为 ["test"]
+        // - 这确保主题层级的语义完全符合 MQTT 协议
+        //
+        // 兼容性：
+        // ✅ "/test" -> ["", "test"]  (符合 MQTT 规范)
+        // ✅ "test"  -> ["test"]      (符合 MQTT 规范)
+        // ✅ "a/b/c" -> ["a", "b", "c"]
+        // ✅ "/a/b"  -> ["", "a", "b"]
+        // ✅ "a/b/"  -> ["a", "b", ""] (尾部空层级也保留)
+
+        var iterator = std.mem.splitScalar(u8, topic, '/');
         while (iterator.next()) |level| {
             try topic_levels.append(allocator, level);
         }
 
-        // var tokenizer = std.mem.tokenize(u8, topic, "/"){};
-
-        // while (tokenizer.next()) |level| {
-        //     try topic_levels.append(level);
-        // }
         return topic_levels.toOwnedSlice(allocator);
     }
 };
