@@ -353,7 +353,7 @@ pub const Writer = struct {
         }
     }
 
-    fn reset(self: *Writer) void {
+    pub fn reset(self: *Writer) void {
         self.pos = 0;
         self.length_pos = null;
     }

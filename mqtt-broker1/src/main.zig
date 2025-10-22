@@ -245,6 +245,7 @@ const MqttBroker = struct {
                 .PINGREQ => {
                     std.debug.print("Client {} sent PINGREQ\n", .{client.id});
                     // MQTT 3.1.1: 服务器必须响应 PINGRESP
+                    writer.reset(); // 清空缓冲区,避免累积旧数据
                     try writer.writeByte(0xD0); // PINGRESP 包类型 (13 << 4 = 208 = 0xD0)
                     try writer.writeByte(0x00); // Remaining Length = 0
                     try writer.writeToStream(&client.stream);
