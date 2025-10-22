@@ -9,6 +9,7 @@ const subscribe = @import("handle_subscribe.zig");
 const assert = std.debug.assert;
 const net = std.net;
 const mem = std.mem;
+const time = std.time;
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const AutoHashMap = std.AutoHashMap;
@@ -200,6 +201,13 @@ const MqttBroker = struct {
                     } else {
                         // Set reason_code to Success if everything is okay
                         reason_code = mqtt.ReasonCode.Success;
+
+                        // 设置客户端信息
+                        client.identifer = connect_packet.client_identifier;
+                        client.keep_alive = connect_packet.keep_alive;
+                        client.clean_start = connect_packet.connect_flags.clean_session;
+                        client.is_connected = true;
+                        client.connect_time = time.milliTimestamp();
 
                         // ack the connection
                         std.debug.print("Client {} connected successfully\n", .{client.id});

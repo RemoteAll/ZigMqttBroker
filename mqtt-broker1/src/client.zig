@@ -100,7 +100,7 @@ pub const Client = struct {
         client.* = .{
             .allocator = allocator,
             .id = id,
-            .identifer = undefined,
+            .identifer = &[_]u8{}, // 初始化为空切片而不是 undefined
             .protocol_version = protocol_version,
             .stream = stream,
             .address = address,
@@ -192,6 +192,12 @@ pub const Client = struct {
 
     pub fn debugPrint(self: *Client) void {
         std.debug.print("----- CLIENT {any} -----\n", .{self.id});
+        // 只有在 identifer 已设置时才打印（长度不为 0 且不是未定义值）
+        if (self.identifer.len > 0) {
+            std.debug.print("Client ID (MQTT): {s}\n", .{self.identifer});
+        } else {
+            std.debug.print("Client ID (MQTT): <not set>\n", .{});
+        }
         std.debug.print("Protocol Version: {any}\n", .{self.protocol_version});
         std.debug.print("Address: {any}\n", .{self.address});
         std.debug.print("Is Connected: {any}\n", .{self.is_connected});
