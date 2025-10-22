@@ -12,13 +12,13 @@ pub const SubscriptionTree = struct {
         pub fn init(allocator: Allocator) Node {
             return Node{
                 .children = std.StringHashMap(Node).init(allocator),
-                .subscribers = ArrayList(*Client).init(allocator),
+                .subscribers = .{},
             };
         }
 
-        pub fn subscribe(self: *Node, topic_levels: [][]const u8, client: *Client) !void {
+        pub fn subscribe(self: *Node, topic_levels: [][]const u8, client: *Client, allocator: Allocator) !void {
             if (topic_levels.len == 0) {
-                try self.subscribers.append(client);
+                try self.subscribers.append(allocator, client);
                 return;
             }
 
@@ -26,31 +26,31 @@ pub const SubscriptionTree = struct {
             if (!child.found_existing) {
                 child.value_ptr.* = Node{
                     .children = std.StringHashMap(Node).init(self.children.allocator),
-                    .subscribers = ArrayList(*Client).init(self.children.allocator),
+                    .subscribers = .{},
                 };
             }
-            try child.value_ptr.subscribe(topic_levels[1..], client);
+            try child.value_ptr.subscribe(topic_levels[1..], client, allocator);
         }
 
-        pub fn match(self: *Node, topic_levels: [][]const u8, matched_clients: *ArrayList(*Client)) !void {
+        pub fn match(self: *Node, topic_levels: [][]const u8, matched_clients: *ArrayList(*Client), allocator: Allocator) !void {
             if (topic_levels.len == 0) {
                 for (self.subscribers.items) |client| {
-                    try matched_clients.append(client);
+                    try matched_clients.append(allocator, client);
                 }
                 return;
             }
 
             if (self.children.get(topic_levels[0])) |child| {
-                try child.match(topic_levels[1..], matched_clients);
+                try child.match(topic_levels[1..], matched_clients, allocator);
             }
         }
-        fn deinit_deep(self: *Node) void {
+        fn deinit_deep(self: *Node, allocator: Allocator) void {
             var it = self.children.iterator();
             while (it.next()) |child| {
-                child.value_ptr.deinit_deep();
+                child.value_ptr.deinit_deep(allocator);
             }
             self.children.deinit();
-            self.subscribers.deinit();
+            self.subscribers.deinit(allocator);
         }
     };
 
@@ -63,28 +63,28 @@ pub const SubscriptionTree = struct {
     }
 
     pub fn deinit(self: *SubscriptionTree) void {
-        self.root.deinit_deep();
+        self.root.deinit_deep(self.root.children.allocator);
     }
 
     pub fn subscribe(self: *SubscriptionTree, topic: []const u8, client: *Client) !void {
         const topic_levels = try parseTopicLevels(topic, self.root.children.allocator);
-        std.debug.print(">> subscribe() >> topic_levels: {s}\n", .{topic_levels});
-        try self.root.subscribe(topic_levels, client);
+        std.debug.print(">> subscribe() >> topic_levels: {any}\n", .{topic_levels});
+        try self.root.subscribe(topic_levels, client, self.root.children.allocator);
     }
 
     pub fn match(self: *SubscriptionTree, topic: []const u8, allocator: *Allocator) !ArrayList(*Client) {
-        const matched_clients = ArrayList(*Client).init(allocator);
+        var matched_clients: ArrayList(*Client) = .{};
         const topic_levels = try parseTopicLevels(topic, self.root.children.allocator);
-        try self.root.match(topic_levels, &matched_clients);
+        try self.root.match(topic_levels, &matched_clients, allocator.*);
         return matched_clients;
     }
 
     fn parseTopicLevels(topic: []const u8, allocator: Allocator) ![][]const u8 {
-        var topic_levels = ArrayList([]const u8).init(allocator);
+        var topic_levels: ArrayList([]const u8) = .{};
 
-        var iterator = std.mem.split(u8, topic, "/");
+        var iterator = std.mem.splitSequence(u8, topic, "/");
         while (iterator.next()) |level| {
-            try topic_levels.append(level);
+            try topic_levels.append(allocator, level);
         }
 
         // var tokenizer = std.mem.tokenize(u8, topic, "/"){};
@@ -92,6 +92,6 @@ pub const SubscriptionTree = struct {
         // while (tokenizer.next()) |level| {
         //     try topic_levels.append(level);
         // }
-        return topic_levels.toOwnedSlice();
+        return topic_levels.toOwnedSlice(allocator);
     }
 };

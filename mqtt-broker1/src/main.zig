@@ -47,19 +47,31 @@ const MqttBroker = struct {
         std.log.info("Starting mqtt server", .{});
         const self_addr = try net.Address.resolveIp("0.0.0.0", port);
         var listener = try self_addr.listen(.{ .reuse_address = true });
-        std.log.info("Listening on {}", .{self_addr});
+        std.log.info("Listening on {any}", .{self_addr});
 
         while (listener.accept()) |conn| {
-            std.log.info("Accepted client connection from: {}", .{conn.address});
+            std.log.info("Accepted client connection from: {any}", .{conn.address});
+
+            // 优化: 设置 TCP_NODELAY 禁用 Nagle 算法,减少延迟
+            if (@import("builtin").os.tag == .windows) {
+                const windows = std.os.windows;
+                const ws2_32 = windows.ws2_32;
+                const enable: c_int = 1;
+                _ = ws2_32.setsockopt(conn.stream.handle, ws2_32.IPPROTO.TCP, ws2_32.TCP.NODELAY, @ptrCast(&enable), @sizeOf(c_int));
+            } else {
+                const enable: c_int = 1;
+                _ = std.posix.setsockopt(conn.stream.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&enable)) catch {};
+            }
 
             const client_id = self.getNextClientId();
             const client = try Client.init(self.allocator, client_id, mqtt.ProtocolVersion.Invalid, conn.stream, conn.address);
             try self.clients.put(client_id, client);
 
             // er... use a threadpool for clients? or is this OK
-            _ = try std.Thread.spawn(.{}, handleClient, .{ self, client });
+            const thread = try std.Thread.spawn(.{}, handleClient, .{ self, client });
+            thread.detach(); // 分离线程,允许并发处理多个客户端
         } else |err| {
-            std.log.info("Error accepting client connection: {}", .{err});
+            std.log.info("Error accepting client connection: {any}", .{err});
         }
     }
 
@@ -83,22 +95,43 @@ const MqttBroker = struct {
             self.allocator.free(read_buffer);
         }
 
-        std.debug.print("Client {} is connecting\n", .{client.address});
+        std.debug.print("Client {any} is connecting\n", .{client.address});
 
         // client event loop
         while (true) {
-            const length = client.stream.read(read_buffer) catch |err| {
-                std.log.err("Error reading from client {}: {}", .{ client.id, err });
-                return ClientError.ClientReadError;
+            // 使用更底层的 recv 来读取 socket 数据,在 Windows 上更可靠
+            const length = blk: {
+                if (@import("builtin").os.tag == .windows) {
+                    // Windows 平台使用 recv
+                    const windows = std.os.windows;
+                    const ws2_32 = windows.ws2_32;
+                    const result = ws2_32.recv(client.stream.handle, read_buffer.ptr, @intCast(read_buffer.len), 0);
+                    if (result == ws2_32.SOCKET_ERROR) {
+                        const err = ws2_32.WSAGetLastError();
+                        if (err == .WSAECONNRESET or err == .WSAECONNABORTED) {
+                            std.log.info("Client {any} connection closed by peer: {any}", .{ client.id, err });
+                            return;
+                        }
+                        std.log.err("Client {any} socket error: {any}", .{ client.id, err });
+                        return ClientError.ClientReadError;
+                    }
+                    break :blk @as(usize, @intCast(result));
+                } else {
+                    // 其他平台使用标准 read
+                    break :blk client.stream.read(read_buffer) catch |err| {
+                        std.log.err("Error reading from client {any}: {any}", .{ client.id, err });
+                        return ClientError.ClientReadError;
+                    };
+                }
             };
 
             if (length == 0) {
-                std.log.info("Client {} sent 0 length packet, disconnected", .{client.id});
+                std.log.info("Client {any} sent 0 length packet, disconnected", .{client.id});
                 return;
             }
 
             reader.start(length) catch |err| {
-                std.log.err("Error starting reader: {}", .{err});
+                std.log.err("Error starting reader: {any}", .{err});
                 return;
             };
 
@@ -122,12 +155,12 @@ const MqttBroker = struct {
             };
 
             if (cmd == .DISCONNECT) {
-                std.log.info("Client {} disconnected", .{client.id});
+                std.log.info("Client {any} disconnected", .{client.id});
                 // TODO - client cleanup like publish will, etc.
                 return;
             } else {
                 const remaining_length = try reader.readRemainingLength();
-                std.debug.print("{} bytes in packet payload\n", .{remaining_length});
+                std.debug.print("{any} bytes in packet payload\n", .{remaining_length});
             }
 
             switch (cmd) {
@@ -208,7 +241,7 @@ const MqttBroker = struct {
                     std.debug.print("Client {} sent DISCONNECT\n", .{client.id});
                 },
                 else => {
-                    std.log.err("Unknown command {} received from client {}", .{ @intFromEnum(cmd), client.id });
+                    std.log.err("Unknown command {any} received from client {any}", .{ @intFromEnum(cmd), client.id });
                     break;
                 },
             }

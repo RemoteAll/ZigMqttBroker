@@ -279,7 +279,10 @@ pub fn connack(writer: *packet.Writer, stream: *net.Stream, reason_code: mqtt.Re
 
     try writer.finishPacket();
 
-    try writer.writeToStream(stream);
+    writer.writeToStream(stream) catch |err| {
+        std.log.err("Failed to write CONNACK to stream: {any}", .{err});
+        return error.StreamWriteError;
+    };
 
     std.debug.print("----------------\n", .{});
 }

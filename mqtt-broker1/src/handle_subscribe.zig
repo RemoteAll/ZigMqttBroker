@@ -50,7 +50,7 @@ pub fn read(reader: *packet.Reader, client: *Client, allocator: Allocator) !*Sub
     const qos = try reader.readByte();
     const topic_filter_qos = mqtt.QoS.fromU8(qos) orelse return SubscribeError.InvalidQoS;
 
-    try sp.topics.append(SubscribePacket.SubscribeTopic{
+    try sp.topics.append(allocator, SubscribePacket.SubscribeTopic{
         .filter = topic_filter,
         .options = SubscribePacket.SubscriptionOptions{
             .reserved = 0,
@@ -88,5 +88,8 @@ pub fn suback(writer: *packet.Writer, stream: *net.Stream, packet_id: u16, clien
 
     try writer.finishPacket();
 
-    try writer.writeToStream(stream);
+    writer.writeToStream(stream) catch |err| {
+        std.log.err("Failed to write SUBACK to stream: {any}", .{err});
+        return error.StreamWriteError;
+    };
 }
