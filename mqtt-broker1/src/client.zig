@@ -190,9 +190,19 @@ pub const Client = struct {
         self.last_activity = time.milliTimestamp();
     }
 
+    /// 获取客户端的完整标识字符串,用于日志输出
+    /// 格式: "Client(mqtt_client_id) #sequence_number" 或 "Client #sequence_number" (如果 MQTT ID 未设置)
+    pub fn getDisplayName(self: *Client, buffer: []u8) ![]const u8 {
+        if (self.identifer.len > 0) {
+            return std.fmt.bufPrint(buffer, "Client({s}) #{d}", .{ self.identifer, self.id });
+        } else {
+            return std.fmt.bufPrint(buffer, "Client #{d}", .{self.id});
+        }
+    }
+
     pub fn debugPrint(self: *Client) void {
         std.debug.print("----- CLIENT {any} -----\n", .{self.id});
-        // 只有在 identifer 已设置时才打印（长度不为 0 且不是未定义值）
+        // 只有在 identifer 已设置时才打印(长度不为 0 且不是未定义值)
         if (self.identifer.len > 0) {
             std.debug.print("Client ID (MQTT): {s}\n", .{self.identifer});
         } else {

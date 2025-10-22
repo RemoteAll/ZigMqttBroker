@@ -17,6 +17,16 @@ const AutoHashMap = std.AutoHashMap;
 const Client = @import("client.zig").Client;
 const ClientError = @import("client.zig").ClientError;
 
+/// 获取客户端显示名称的辅助函数
+/// 使用线程局部存储避免每次都分配缓冲区
+fn getClientDisplayName(client: *Client) []const u8 {
+    // 使用线程局部静态缓冲区,避免重复分配
+    const S = struct {
+        threadlocal var buffer: [128]u8 = undefined;
+    };
+    return client.getDisplayName(&S.buffer) catch "Client";
+}
+
 // MQTT broker
 const MqttBroker = struct {
     allocator: Allocator,
@@ -110,24 +120,24 @@ const MqttBroker = struct {
                     if (result == ws2_32.SOCKET_ERROR) {
                         const err = ws2_32.WSAGetLastError();
                         if (err == .WSAECONNRESET or err == .WSAECONNABORTED) {
-                            std.log.info("Client {any} connection closed by peer: {any}", .{ client.id, err });
+                            std.log.info("{s} connection closed by peer: {any}", .{ getClientDisplayName(client), err });
                             return;
                         }
-                        std.log.err("Client {any} socket error: {any}", .{ client.id, err });
+                        std.log.err("{s} socket error: {any}", .{ getClientDisplayName(client), err });
                         return ClientError.ClientReadError;
                     }
                     break :blk @as(usize, @intCast(result));
                 } else {
                     // 其他平台使用标准 read
                     break :blk client.stream.read(read_buffer) catch |err| {
-                        std.log.err("Error reading from client {any}: {any}", .{ client.id, err });
+                        std.log.err("Error reading from {s}: {any}", .{ getClientDisplayName(client), err });
                         return ClientError.ClientReadError;
                     };
                 }
             };
 
             if (length == 0) {
-                std.log.info("Client {any} sent 0 length packet, disconnected", .{client.id});
+                std.log.info("{s} sent 0 length packet, disconnected", .{getClientDisplayName(client)});
                 return;
             }
 
@@ -143,7 +153,8 @@ const MqttBroker = struct {
 
     /// Read the buffer looking for packets
     fn read(self: *MqttBroker, client: *Client, reader: *packet.Reader, writer: *packet.Writer, length: usize) !void {
-        std.debug.print("Reading bytes from client {} {any}\n", .{ client.id, reader.buffer[0..length] });
+        const client_name = getClientDisplayName(client);
+        std.debug.print("Reading bytes from {s} {any}\n", .{ client_name, reader.buffer[0..length] });
 
         // multiple packets can be in the buffer, loop until its fully read
         while (reader.pos < reader.length) {
@@ -156,7 +167,7 @@ const MqttBroker = struct {
             };
 
             if (cmd == .DISCONNECT) {
-                std.log.info("Client {any} disconnected", .{client.id});
+                std.log.info("{s} disconnected", .{client_name});
                 // TODO - client cleanup like publish will, etc.
                 return;
             } else {
@@ -192,11 +203,11 @@ const MqttBroker = struct {
                         }
 
                         // ack the connection and disconnect
-                        std.debug.print("Client {} connected unsuccessfully\n", .{client.id});
+                        std.debug.print("{s} connected unsuccessfully\n", .{client_name});
                         try connect.connack(writer, &client.stream, reason_code);
-                        std.debug.print("Server sent CONNACK to Client {}\n", .{client.id});
+                        std.debug.print("Server sent CONNACK to {s}\n", .{client_name});
                         // try connect.disconnect(writer, &client.stream, reason_code);
-                        // std.debug.print("Server sent DISCONNECT to Client {}\n", .{client.id});
+                        // std.debug.print("Server sent DISCONNECT to {s}\n", .{client_name});
                         return;
                     } else {
                         // Set reason_code to Success if everything is okay
@@ -209,10 +220,11 @@ const MqttBroker = struct {
                         client.is_connected = true;
                         client.connect_time = time.milliTimestamp();
 
-                        // ack the connection
-                        std.debug.print("Client {} connected successfully\n", .{client.id});
+                        // ack the connection (重新获取 client_name,因为 identifer 已更新)
+                        const client_name_updated = getClientDisplayName(client);
+                        std.debug.print("{s} connected successfully\n", .{client_name_updated});
                         try connect.connack(writer, &client.stream, reason_code);
-                        std.debug.print("Server sent CONNACK to Client {}\n", .{client.id});
+                        std.debug.print("Server sent CONNACK to {s}\n", .{client_name_updated});
 
                         client.debugPrint();
                     }
@@ -223,7 +235,7 @@ const MqttBroker = struct {
                     std.debug.print("Subscribe packet: {any}\n", .{subscribe_packet});
                     for (subscribe_packet.topics.items) |topic| {
                         try self.subscriptions.subscribe(topic.filter, client);
-                        std.debug.print("Client {} subscribed to topic {s}\n", .{ client.id, topic.filter });
+                        std.debug.print("{s} subscribed to topic {s}\n", .{ client_name, topic.filter });
                     }
 
                     std.debug.print("self.subscriptions: {any}\n", .{self.subscriptions});
@@ -231,31 +243,31 @@ const MqttBroker = struct {
                     // the Server MUST respond with a SUBACK Packet [MQTT-3.8.4-1]
                     try subscribe.suback(writer, &client.stream, subscribe_packet.packet_id, client);
 
-                    std.debug.print("Server sent SUBACK to Client {}\n", .{client.id});
+                    std.debug.print("Server sent SUBACK to {s}\n", .{client_name});
                 },
                 .PUBLISH => {
-                    std.debug.print("Client {} sent PUBLISH\n", .{client.id});
+                    std.debug.print("{s} sent PUBLISH\n", .{client_name});
                 },
                 .UNSUBSCRIBE => {
-                    std.debug.print("Client {} sent UNSUBSCRIBE\n", .{client.id});
+                    std.debug.print("{s} sent UNSUBSCRIBE\n", .{client_name});
                 },
                 .PUBREC => {
-                    std.debug.print("Client {} sent PUBREC\n", .{client.id});
+                    std.debug.print("{s} sent PUBREC\n", .{client_name});
                 },
                 .PINGREQ => {
-                    std.debug.print("Client {} sent PINGREQ\n", .{client.id});
+                    std.debug.print("{s} sent PINGREQ\n", .{client_name});
                     // MQTT 3.1.1: 服务器必须响应 PINGRESP
                     writer.reset(); // 清空缓冲区,避免累积旧数据
                     try writer.writeByte(0xD0); // PINGRESP 包类型 (13 << 4 = 208 = 0xD0)
                     try writer.writeByte(0x00); // Remaining Length = 0
                     try writer.writeToStream(&client.stream);
-                    std.debug.print("Server sent PINGRESP to Client {}\n", .{client.id});
+                    std.debug.print("Server sent PINGRESP to {s}\n", .{client_name});
                 },
                 .DISCONNECT => {
-                    std.debug.print("Client {} sent DISCONNECT\n", .{client.id});
+                    std.debug.print("{s} sent DISCONNECT\n", .{client_name});
                 },
                 else => {
-                    std.log.err("Unknown command {any} received from client {any}", .{ @intFromEnum(cmd), client.id });
+                    std.log.err("Unknown command {any} received from {s}", .{ @intFromEnum(cmd), client_name });
                     break;
                 },
             }
