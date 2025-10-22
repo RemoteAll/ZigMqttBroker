@@ -244,6 +244,11 @@ const MqttBroker = struct {
                 },
                 .PINGREQ => {
                     std.debug.print("Client {} sent PINGREQ\n", .{client.id});
+                    // MQTT 3.1.1: 服务器必须响应 PINGRESP
+                    try writer.writeByte(0xD0); // PINGRESP 包类型 (13 << 4 = 208 = 0xD0)
+                    try writer.writeByte(0x00); // Remaining Length = 0
+                    try writer.writeToStream(&client.stream);
+                    std.debug.print("Server sent PINGRESP to Client {}\n", .{client.id});
                 },
                 .DISCONNECT => {
                     std.debug.print("Client {} sent DISCONNECT\n", .{client.id});
