@@ -215,8 +215,8 @@ const MqttBroker = struct {
                         // Set reason_code to Success if everything is okay
                         reason_code = mqtt.ReasonCode.Success;
 
-                        // 设置客户端信息
-                        client.identifer = connect_packet.client_identifier;
+                        // 设置客户端信息(需要拷贝 client_identifier,因为它指向 Reader 的临时缓冲区)
+                        client.identifer = try self.allocator.dupe(u8, connect_packet.client_identifier);
                         client.protocol_version = mqtt.ProtocolVersion.fromU8(connect_packet.protocol_version);
                         client.keep_alive = connect_packet.keep_alive;
                         client.clean_start = connect_packet.connect_flags.clean_session;

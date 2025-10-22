@@ -136,7 +136,8 @@ pub const Client = struct {
         if (self.password) |password| self.allocator.free(password);
         if (self.will_topic) |topic| self.allocator.free(topic);
         if (self.will_payload) |payload| self.allocator.free(payload);
-        // self.allocator.free(self.identifer);
+        // 释放客户端标识符(如果已分配)
+        if (self.identifer.len > 0) self.allocator.free(self.identifer);
         self.subscriptions.deinit(self.allocator);
         self.incoming_queue.deinit(self.allocator);
         self.outgoing_queue.deinit(self.allocator);
