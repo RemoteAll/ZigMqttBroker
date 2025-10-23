@@ -156,6 +156,8 @@ const ClientConnection = struct {
         self.state = .Processing;
 
         while (self.reader.pos < self.reader.length) {
+            const start_pos = self.reader.pos;
+
             const cmd = self.reader.readCommand() catch |err| {
                 logger.warn("Client {d} unknown command: {any}", .{ self.id, err });
                 break;
@@ -168,6 +170,17 @@ const ClientConnection = struct {
             }
 
             const remaining_length = try self.reader.readRemainingLength();
+
+            // 计算当前包的结束位置
+            const packet_end_pos = self.reader.pos + remaining_length;
+
+            // 检查是否有完整的包数据
+            if (packet_end_pos > self.reader.length) {
+                // 数据不完整,回退到包开始位置,等待更多数据
+                self.reader.pos = start_pos;
+                break;
+            }
+
             logger.debug("Client {d} packet type={any} payload={d} bytes", .{ self.id, cmd, remaining_length });
 
             switch (cmd) {
@@ -176,10 +189,18 @@ const ClientConnection = struct {
                 .PUBLISH => try self.handlePublish(),
                 .UNSUBSCRIBE => try self.handleUnsubscribe(),
                 .PINGREQ => try self.handlePingreq(),
+                .PUBACK => try self.handlePuback(),
+                .PUBREC => try self.handlePubrec(),
+                .PUBREL => try self.handlePubrel(),
+                .PUBCOMP => try self.handlePubcomp(),
                 else => {
                     logger.warn("Client {d} unhandled packet type: {any}", .{ self.id, cmd });
                 },
             }
+
+            // 无论handler是否正确处理,都强制跳转到下一个包的起始位置
+            // 这样可以避免包边界混乱的问题
+            self.reader.pos = packet_end_pos;
         }
     }
 
@@ -310,6 +331,60 @@ const ClientConnection = struct {
         try self.writer.writeByte(0); // Remaining length = 0
         try self.writer.writeToStream(&self.client.stream);
         logger.debug("Client {d} PINGREQ -> PINGRESP", .{self.id});
+    }
+
+    /// 处理 PUBACK (QoS 1 发布确认)
+    fn handlePuback(self: *ClientConnection) !void {
+        // 读取 packet_id (2 字节)
+        const packet_id = try self.reader.readTwoBytes();
+        logger.debug("Client {d} ({s}) sent PUBACK for packet {d}", .{ self.id, self.client.identifer, packet_id });
+
+        // TODO: 从待确认队列中移除对应的消息
+        // 这里应该维护一个 pending_messages 映射来跟踪等待确认的消息
+    }
+
+    /// 处理 PUBREC (QoS 2 发布接收 - 第一步)
+    fn handlePubrec(self: *ClientConnection) !void {
+        // 读取 packet_id (2 字节)
+        const packet_id = try self.reader.readTwoBytes();
+        logger.debug("Client {d} ({s}) sent PUBREC for packet {d}", .{ self.id, self.client.identifer, packet_id });
+
+        // 响应 PUBREL (QoS 2 第二步)
+        self.writer.reset();
+        try self.writer.writeByte(0x62); // PUBREL 包类型 (0110 0010)
+        try self.writer.writeByte(2); // Remaining length = 2 (packet_id)
+        try self.writer.writeTwoBytes(packet_id);
+        try self.writer.writeToStream(&self.client.stream);
+
+        logger.debug("Client {d} sent PUBREL for packet {d}", .{ self.id, packet_id });
+    }
+
+    /// 处理 PUBREL (QoS 2 发布释放 - 第二步，来自客户端)
+    fn handlePubrel(self: *ClientConnection) !void {
+        // 读取 packet_id (2 字节)
+        const packet_id = try self.reader.readTwoBytes();
+        logger.debug("Client {d} ({s}) sent PUBREL for packet {d}", .{ self.id, self.client.identifer, packet_id });
+
+        // 响应 PUBCOMP (QoS 2 第三步 - 完成)
+        self.writer.reset();
+        try self.writer.writeByte(0x70); // PUBCOMP 包类型 (0111 0000)
+        try self.writer.writeByte(2); // Remaining length = 2 (packet_id)
+        try self.writer.writeTwoBytes(packet_id);
+        try self.writer.writeToStream(&self.client.stream);
+
+        logger.debug("Client {d} sent PUBCOMP for packet {d}", .{ self.id, packet_id });
+
+        // TODO: 从待处理队列中移除对应的消息
+    }
+
+    /// 处理 PUBCOMP (QoS 2 发布完成 - 第三步确认)
+    fn handlePubcomp(self: *ClientConnection) !void {
+        // 读取 packet_id (2 字节)
+        const packet_id = try self.reader.readTwoBytes();
+        logger.debug("Client {d} ({s}) sent PUBCOMP for packet {d}", .{ self.id, self.client.identifer, packet_id });
+
+        // QoS 2 流程完成，从待确认队列中移除消息
+        // TODO: 实现 pending_qos2_messages 映射
     }
 
     /// 转发给单个订阅者
