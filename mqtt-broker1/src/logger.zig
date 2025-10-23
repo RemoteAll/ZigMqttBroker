@@ -37,13 +37,18 @@ pub fn setLevel(level: Level) void {
     global_level = level;
 }
 
-/// 获取当前时间戳字符串 (格式: YYYY-MM-DD HH:MM:SS)
+/// 获取当前时间戳字符串 (格式: YYYY-MM-DD HH:MM:SS.nnnnnnnnn)
 fn getTimestamp(allocator: std.mem.Allocator) ![]const u8 {
-    const timestamp = std.time.timestamp();
+    // 获取纳秒级时间戳
+    const nanos: i128 = std.time.nanoTimestamp();
+
+    // 转换为秒和纳秒部分
+    const timestamp: i64 = @intCast(@divFloor(nanos, std.time.ns_per_s));
+    const nano_part: u32 = @intCast(@mod(nanos, std.time.ns_per_s));
 
     // 获取本地时区偏移（秒）
-    const local_offset = getLocalTimezoneOffset();
-    const local_timestamp = timestamp + local_offset;
+    const local_offset: i64 = getLocalTimezoneOffset();
+    const local_timestamp: i64 = timestamp + local_offset;
 
     const seconds_since_epoch: i64 = local_timestamp;
 
@@ -58,8 +63,8 @@ fn getTimestamp(allocator: std.mem.Allocator) ![]const u8 {
     // 准确的日期计算（考虑闰年）
     const date = epochDaysToDate(days_since_epoch);
 
-    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
-        date.year, date.month, date.day, hour, minute, second,
+    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>9}", .{
+        date.year, date.month, date.day, hour, minute, second, nano_part,
     });
 }
 
@@ -208,7 +213,7 @@ fn log(level: Level, comptime fmt: []const u8, args: anytype) void {
     const allocator = arena.allocator();
 
     // 获取时间戳
-    const timestamp = getTimestamp(allocator) catch "????-??-?? ??:??:??";
+    const timestamp = getTimestamp(allocator) catch "????-??-?? ??:??:??.?????????";
 
     // 格式化用户消息
     const message = std.fmt.allocPrint(allocator, fmt, args) catch return;
