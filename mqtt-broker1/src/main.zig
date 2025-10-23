@@ -6,6 +6,7 @@ const connect = @import("handle_connect.zig");
 const ConnectError = @import("handle_connect.zig").ConnectError;
 const SubscriptionTree = @import("subscription.zig").SubscriptionTree;
 const subscribe = @import("handle_subscribe.zig");
+const unsubscribe = @import("handle_unsubscribe.zig");
 const logger = @import("logger.zig");
 const assert = std.debug.assert;
 const net = std.net;
@@ -255,7 +256,31 @@ const MqttBroker = struct {
                 },
                 .UNSUBSCRIBE => {
                     logger.debug("{s} sent UNSUBSCRIBE", .{client_name});
-                    // TODO: 实现 UNSUBSCRIBE 处理
+
+                    const unsubscribe_packet = try unsubscribe.read(reader, self.allocator);
+                    defer {
+                        unsubscribe_packet.deinit(self.allocator);
+                        self.allocator.destroy(unsubscribe_packet);
+                    }
+
+                    logger.debug("Processing UNSUBSCRIBE packet with {d} topic(s)", .{unsubscribe_packet.topics.items.len});
+                    for (unsubscribe_packet.topics.items) |topic| {
+                        // 从主题树中移除订阅
+                        const removed = try self.subscriptions.unsubscribe(topic, client);
+
+                        if (removed) {
+                            // 同步更新客户端的订阅列表
+                            client.removeSubscription(topic);
+                            logger.info("{s} unsubscribed from topic: {s}", .{ client_name, topic });
+                        } else {
+                            logger.warn("{s} attempted to unsubscribe from topic '{s}' but was not subscribed", .{ client_name, topic });
+                        }
+                    }
+
+                    // 服务器必须响应 UNSUBACK 数据包 [MQTT-3.10.4-4]
+                    // 注意:即使取消订阅失败,也要发送 UNSUBACK (MQTT 规范要求)
+                    try unsubscribe.unsuback(writer, &client.stream, unsubscribe_packet.packet_id);
+                    logger.debug("Server sent UNSUBACK to {s}", .{client_name});
                 },
                 .PUBREC => {
                     logger.debug("{s} sent PUBREC", .{client_name});

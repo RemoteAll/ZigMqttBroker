@@ -32,6 +32,45 @@ pub const SubscriptionTree = struct {
             try child.value_ptr.subscribe(topic_levels[1..], client, allocator);
         }
 
+        pub fn unsubscribe(self: *Node, topic_levels: [][]const u8, client: *Client, allocator: Allocator) !bool {
+            if (topic_levels.len == 0) {
+                // 到达目标层级,移除该客户端
+                var found = false;
+                var i: usize = 0;
+                while (i < self.subscribers.items.len) {
+                    if (self.subscribers.items[i].id == client.id) {
+                        _ = self.subscribers.swapRemove(i);
+                        found = true;
+                        // 不增加 i,因为 swapRemove 会把最后一个元素移到当前位置
+                        // 需要继续检查当前位置(如果有重复订阅的话)
+                        continue;
+                    }
+                    i += 1;
+                }
+                return found;
+            }
+
+            // 继续向下查找
+            if (self.children.getPtr(topic_levels[0])) |child| {
+                const found = try child.unsubscribe(topic_levels[1..], client, allocator);
+
+                // 清理空节点:如果子节点没有订阅者且没有子节点,则删除该子节点
+                if (found and child.subscribers.items.len == 0 and child.children.count() == 0) {
+                    // 需要递归释放子节点资源
+                    const removed_node = self.children.fetchRemove(topic_levels[0]);
+                    if (removed_node) |entry| {
+                        var node = entry.value;
+                        node.deinit_deep(allocator);
+                    }
+                }
+
+                return found;
+            }
+
+            // 主题路径不存在
+            return false;
+        }
+
         pub fn match(self: *Node, topic_levels: [][]const u8, matched_clients: *ArrayList(*Client), allocator: Allocator) !void {
             // 如果没有更多层级，收集当前节点的订阅者
             if (topic_levels.len == 0) {
@@ -85,9 +124,24 @@ pub const SubscriptionTree = struct {
         // 验证主题过滤器格式
         try validateTopicFilter(topic);
 
-        const topic_levels = try parseTopicLevels(topic, self.root.children.allocator);
+        const allocator = self.root.children.allocator;
+        const topic_levels = try parseTopicLevels(topic, allocator);
+        defer allocator.free(topic_levels); // 释放 parseTopicLevels 分配的内存
+
         std.debug.print(">> subscribe() >> topic_levels: {any}\n", .{topic_levels});
-        try self.root.subscribe(topic_levels, client, self.root.children.allocator);
+        try self.root.subscribe(topic_levels, client, allocator);
+    }
+
+    pub fn unsubscribe(self: *SubscriptionTree, topic: []const u8, client: *Client) !bool {
+        // 验证主题过滤器格式
+        try validateTopicFilter(topic);
+
+        const allocator = self.root.children.allocator;
+        const topic_levels = try parseTopicLevels(topic, allocator);
+        defer allocator.free(topic_levels); // 释放 parseTopicLevels 分配的内存
+
+        std.debug.print(">> unsubscribe() >> topic_levels: {any}\n", .{topic_levels});
+        return try self.root.unsubscribe(topic_levels, client, allocator);
     }
 
     pub fn match(self: *SubscriptionTree, topic: []const u8, allocator: *Allocator) !ArrayList(*Client) {
