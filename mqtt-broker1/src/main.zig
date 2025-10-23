@@ -9,6 +9,7 @@ const subscribe = @import("handle_subscribe.zig");
 const unsubscribe = @import("handle_unsubscribe.zig");
 const publish = @import("handle_publish.zig");
 const logger = @import("logger.zig");
+const SubscriptionPersistence = @import("persistence.zig").SubscriptionPersistence;
 const assert = std.debug.assert;
 const net = std.net;
 const mem = std.mem;
@@ -36,13 +37,27 @@ const MqttBroker = struct {
     clients: AutoHashMap(u64, *Client),
     next_client_id: u64,
     subscriptions: SubscriptionTree,
+    persistence: *SubscriptionPersistence,
 
-    pub fn init(allocator: Allocator) MqttBroker {
+    pub fn init(allocator: Allocator) !MqttBroker {
+        // 初始化订阅持久化管理器
+        const persistence = try allocator.create(SubscriptionPersistence);
+        persistence.* = try SubscriptionPersistence.init(allocator, "data/subscriptions.json");
+
+        // 从文件加载已保存的订阅
+        persistence.loadFromFile() catch |err| {
+            logger.warn("Failed to load persisted subscriptions: {any}", .{err});
+        };
+
+        var subscriptions = SubscriptionTree.init(allocator);
+        subscriptions.setPersistence(persistence);
+
         return MqttBroker{
             .allocator = allocator,
             .clients = AutoHashMap(u64, *Client).init(allocator),
             .next_client_id = 1,
-            .subscriptions = SubscriptionTree.init(allocator),
+            .subscriptions = subscriptions,
+            .persistence = persistence,
         };
     }
 
@@ -54,6 +69,10 @@ const MqttBroker = struct {
         }
         self.clients.deinit();
         self.subscriptions.deinit();
+
+        // 清理持久化管理器
+        self.persistence.deinit();
+        self.allocator.destroy(self.persistence);
     }
 
     // start the server on the given port
@@ -360,6 +379,16 @@ const MqttBroker = struct {
                         try connect.connack(writer, &client.stream, reason_code, session_present);
                         logger.debug("Server sent CONNACK to {s}", .{client_name_updated});
 
+                        // 如果 Clean Session = 0 且有持久化的订阅，恢复订阅
+                        if (!connect_packet.connect_flags.clean_session) {
+                            self.subscriptions.restoreClientSubscriptions(client) catch |err| {
+                                logger.err("Failed to restore subscriptions for client {s}: {any}", .{ client.identifer, err });
+                            };
+                        } else {
+                            // Clean Session = 1，清理该客户端的所有持久化订阅
+                            self.subscriptions.unsubscribeAll(client);
+                        }
+
                         // 保留详细的客户端信息打印用于调试
                         if (@import("builtin").mode == .Debug) {
                             client.debugPrint();
@@ -509,7 +538,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var broker = MqttBroker.init(allocator);
+    var broker = try MqttBroker.init(allocator);
     defer broker.deinit();
 
     // TODO have a config file that updates values in config.zig

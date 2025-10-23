@@ -1,0 +1,31 @@
+{
+  "subscriptions": {
+    "mqttx_53405449": [
+      {
+        "topic_filter": "testtopic/#",
+        "qos": 0,
+        "no_local": false,
+        "retain_as_published": false,
+        "retain_handling": 0
+      }
+    ],
+    "mqttx_a67c1ac5": [
+      {
+        "topic_filter": "testtopic/#",
+        "qos": 0,
+        "no_local": false,
+        "retain_as_published": false,
+        "retain_handling": 0
+      }
+    ],
+    "5d339068b588496b88527c1392b8452d": [
+      {
+        "topic_filter": "testtopic/#",
+        "qos": 0,
+        "no_local": false,
+        "retain_as_published": false,
+        "retain_handling": 0
+      }
+    ]
+  }
+}

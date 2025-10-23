@@ -3,6 +3,7 @@ const Client = @import("client.zig").Client;
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const logger = @import("logger.zig");
+const SubscriptionPersistence = @import("persistence.zig").SubscriptionPersistence;
 
 /// 主题匹配缓存项
 const CacheEntry = struct {
@@ -176,6 +177,8 @@ pub const SubscriptionTree = struct {
     /// 缓存统计(原子操作,无锁)
     cache_hits: std.atomic.Value(usize),
     cache_misses: std.atomic.Value(usize),
+    /// 订阅持久化管理器
+    persistence: ?*SubscriptionPersistence,
 
     pub fn init(allocator: Allocator) SubscriptionTree {
         return SubscriptionTree{
@@ -185,7 +188,13 @@ pub const SubscriptionTree = struct {
             .cache_rwlock = .{},
             .cache_hits = std.atomic.Value(usize).init(0),
             .cache_misses = std.atomic.Value(usize).init(0),
+            .persistence = null,
         };
+    }
+
+    /// 设置持久化管理器
+    pub fn setPersistence(self: *SubscriptionTree, persistence: *SubscriptionPersistence) void {
+        self.persistence = persistence;
     }
 
     pub fn deinit(self: *SubscriptionTree) void {
@@ -254,6 +263,21 @@ pub const SubscriptionTree = struct {
 
         // 订阅关系改变,增加版本号(缓存延迟失效)
         self.bumpCacheVersion();
+
+        // 持久化订阅(异步,不阻塞主流程)
+        if (self.persistence) |persistence| {
+            const subscription = Client.Subscription{
+                .topic_filter = topic,
+                .qos = .AtMostOnce, // 默认 QoS 0,后续可从参数传入
+                .no_local = false,
+                .retain_as_published = false,
+                .retain_handling = .SendRetained,
+                .subscription_identifier = null,
+            };
+            persistence.addSubscription(client.identifer, subscription) catch |err| {
+                logger.err("Failed to persist subscription for client '{s}': {any}", .{ client.identifer, err });
+            };
+        }
     }
 
     pub fn unsubscribe(self: *SubscriptionTree, topic: []const u8, client: *Client) !bool {
@@ -270,6 +294,13 @@ pub const SubscriptionTree = struct {
         // 取消订阅成功,增加版本号(缓存延迟失效)
         if (result) {
             self.bumpCacheVersion();
+
+            // 持久化取消订阅
+            if (self.persistence) |persistence| {
+                persistence.removeSubscription(client.identifer, topic) catch |err| {
+                    logger.err("Failed to persist unsubscription for client '{s}': {any}", .{ client.identifer, err });
+                };
+            }
         }
 
         return result;
@@ -279,11 +310,50 @@ pub const SubscriptionTree = struct {
     pub fn unsubscribeAll(self: *SubscriptionTree, client: *Client) void {
         const allocator = self.root.children.allocator;
         self.root.unsubscribeClientFromAll(client, allocator);
-        
+
         // 订阅关系改变,增加版本号(缓存延迟失效)
         self.bumpCacheVersion();
-        
+
+        // 持久化清理
+        if (self.persistence) |persistence| {
+            persistence.removeAllSubscriptions(client.identifer) catch |err| {
+                logger.err("Failed to persist unsubscribe all for client '{s}': {any}", .{ client.identifer, err });
+            };
+        }
+
         logger.info("Unsubscribed all topics for client {s}", .{client.identifer});
+    }
+
+    /// 恢复客户端的订阅(用于重连时从持久化存储恢复)
+    pub fn restoreClientSubscriptions(self: *SubscriptionTree, client: *Client) !void {
+        if (self.persistence) |persistence| {
+            const allocator = self.root.children.allocator;
+
+            // 从持久化存储获取订阅
+            var subscriptions_opt = try persistence.getClientSubscriptions(client.identifer, allocator);
+            if (subscriptions_opt) |*subscriptions| {
+                defer {
+                    for (subscriptions.items) |sub| {
+                        allocator.free(sub.topic_filter);
+                    }
+                    subscriptions.deinit(allocator);
+                }
+
+                // 恢复每个订阅到主题树
+                for (subscriptions.items) |sub| {
+                    try self.subscribe(sub.topic_filter, client);
+
+                    // 同时恢复到客户端的订阅列表
+                    try client.addSubscription(sub);
+
+                    logger.info("Restored subscription for client '{s}' to topic '{s}'", .{ client.identifer, sub.topic_filter });
+                }
+
+                logger.info("Restored {d} subscription(s) for client '{s}'", .{ subscriptions.items.len, client.identifer });
+            } else {
+                logger.debug("No persisted subscriptions found for client '{s}'", .{client.identifer});
+            }
+        }
     }
 
     /// 匹配订阅的客户端,支持去重、no_local 过滤和高性能缓存

@@ -10,6 +10,7 @@ const unsubscribe = @import("handle_unsubscribe.zig");
 const publish = @import("handle_publish.zig");
 const logger = @import("logger.zig");
 const Metrics = @import("metrics.zig").Metrics;
+const SubscriptionPersistence = @import("persistence.zig").SubscriptionPersistence;
 const assert = std.debug.assert;
 const net = std.net;
 const mem = std.mem;
@@ -308,13 +309,28 @@ const ClientConnection = struct {
         // 检查是否是重连（同一个 MQTT Client ID）
         const mqtt_client_id = self.client.identifer;
         const has_existing_session = self.broker.clients.get(mqtt_client_id) != null;
-        
+
+        // 检查是否有持久化的订阅（用于判断 session_present）
+        const has_persisted_subscriptions = blk: {
+            var subs = self.broker.persistence.getClientSubscriptions(mqtt_client_id, self.arena.allocator()) catch null;
+            if (subs) |*s| {
+                defer {
+                    for (s.items) |sub| {
+                        self.arena.allocator().free(sub.topic_filter);
+                    }
+                    s.deinit(self.arena.allocator());
+                }
+                break :blk s.items.len > 0;
+            }
+            break :blk false;
+        };
+
         if (self.broker.clients.get(mqtt_client_id)) |old_conn| {
             logger.info("Client {s} is reconnecting (old_conn #{d}), handling session...", .{ mqtt_client_id, old_conn.id });
-            
+
             // 根据 Clean Session 标志决定如何处理旧会话
             if (connect_packet.connect_flags.clean_session) {
-                // Clean Session = 1: 清除旧会话的所有订阅
+                // Clean Session = 1: 清除旧会话的所有订阅（包括持久化）
                 logger.info("Clean Session = 1, clearing old subscriptions for {s}", .{mqtt_client_id});
                 self.broker.subscriptions.unsubscribeAll(old_conn.client);
             } else {
@@ -323,7 +339,7 @@ const ClientConnection = struct {
                 logger.info("Clean Session = 0, preserving subscriptions for {s}", .{mqtt_client_id});
                 // 订阅树中的 *Client 指针会在下面的 put 操作后自动指向新的 client
             }
-            
+
             // 关闭旧连接的 socket 和网络资源
             self.broker.io.close_socket(old_conn.socket);
             // 注意：不调用 old_conn.deinit()，因为订阅树可能还在引用 old_conn.client
@@ -339,7 +355,7 @@ const ClientConnection = struct {
         const session_present = if (connect_packet.connect_flags.clean_session)
             false // Clean Session = 1 时必须返回 false
         else
-            has_existing_session; // Clean Session = 0 时，如果有旧会话则返回 true
+            (has_existing_session or has_persisted_subscriptions); // Clean Session = 0 时，如果有旧会话或持久化订阅则返回 true
 
         // 发送 CONNACK
         try connect.connack(self.writer, &self.client.stream, reason_code, session_present);
@@ -360,6 +376,13 @@ const ClientConnection = struct {
             connect_packet.connect_flags.clean_session,
             session_present,
         });
+
+        // 如果 session_present = true，恢复持久化的订阅到主题树
+        if (session_present and !connect_packet.connect_flags.clean_session) {
+            self.broker.subscriptions.restoreClientSubscriptions(self.client) catch |err| {
+                logger.err("Failed to restore subscriptions for client {s}: {any}", .{ self.client.identifer, err });
+            };
+        }
     }
 
     fn handleSubscribe(self: *ClientConnection) !void {
@@ -653,6 +676,9 @@ pub const MqttBroker = struct {
     stats_completion: IO.Completion = undefined,
     metrics: Metrics,
 
+    // 订阅持久化管理器
+    persistence: *SubscriptionPersistence,
+
     pub fn init(allocator: Allocator) !*MqttBroker {
         const io = try allocator.create(IO);
         io.* = try IO.init(config.IO_ENTRIES, 0);
@@ -662,16 +688,29 @@ pub const MqttBroker = struct {
         try client_pool.preheat(config.MAX_CLIENTS_POOL);
         logger.info("Client pool preheated with {d} connections", .{config.MAX_CLIENTS_POOL});
 
+        // 初始化订阅持久化管理器
+        const persistence = try allocator.create(SubscriptionPersistence);
+        persistence.* = try SubscriptionPersistence.init(allocator, "data/subscriptions.json");
+
+        // 从文件加载已保存的订阅
+        persistence.loadFromFile() catch |err| {
+            logger.warn("Failed to load persisted subscriptions: {any}", .{err});
+        };
+
+        var subscriptions = SubscriptionTree.init(allocator);
+        subscriptions.setPersistence(persistence);
+
         const self = try allocator.create(MqttBroker);
         self.* = .{
             .allocator = allocator,
             .io = io,
             .clients = std.StringHashMap(*ClientConnection).init(allocator),
             .next_client_id = 1,
-            .subscriptions = SubscriptionTree.init(allocator),
+            .subscriptions = subscriptions,
             .server_socket = IO.INVALID_SOCKET,
             .client_pool = client_pool,
             .metrics = Metrics.init(),
+            .persistence = persistence,
         };
 
         return self;
@@ -698,6 +737,10 @@ pub const MqttBroker = struct {
         }
 
         self.subscriptions.deinit();
+
+        // 清理持久化管理器
+        self.persistence.deinit();
+        self.allocator.destroy(self.persistence);
 
         // 清理内存池
         self.client_pool.deinit();

@@ -218,7 +218,7 @@ pub const Client = struct {
     }
 
     pub fn addSubscription(self: *Client, subscription: Subscription) !void {
-        try self.subscriptions.append(subscription);
+        try self.subscriptions.append(self.allocator, subscription);
         std.log.info("Client {s} subscribed to {s}", .{ self.identifer, subscription.topic_filter });
     }
     pub fn removeSubscription(self: *Client, topic_filter: []const u8) void {
