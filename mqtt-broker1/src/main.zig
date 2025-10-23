@@ -243,6 +243,24 @@ const MqttBroker = struct {
         var reader = packet.Reader.init(read_buffer);
 
         defer {
+            // 客户端断开连接时的清理
+            logger.info("Client {s} disconnecting (clean_start={})", .{ client.identifer, client.clean_start });
+
+            // 标记为已断开
+            client.is_connected = false;
+
+            // 根据 Clean Session 标志决定是否清理订阅
+            // [MQTT-3.1.2-6] Clean Session = 1: 断开时必须删除会话状态
+            // [MQTT-3.1.2-5] Clean Session = 0: 断开时保留会话状态
+            if (client.clean_start) {
+                // Clean Session = 1: 清理订阅(从主题树和持久化)
+                logger.info("Client {s} disconnecting with Clean Session = 1, clearing all subscriptions", .{client.identifer});
+                self.subscriptions.unsubscribeAll(client);
+            } else {
+                // Clean Session = 0: 保留订阅,仅标记为离线
+                logger.info("Client {s} disconnecting with Clean Session = 0, preserving subscriptions for reconnection", .{client.identifer});
+            }
+
             _ = self.clients.remove(client.id);
             client.deinit();
             writer.deinit();

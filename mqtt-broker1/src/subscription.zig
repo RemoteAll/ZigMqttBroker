@@ -157,6 +157,28 @@ pub const SubscriptionTree = struct {
                 std.debug.print(">> No match found for '{s}'\n", .{current_level});
             }
         }
+
+        /// 递归检查主题树中是否存在指定客户端的订阅
+        /// 用于重连优化：避免重复从文件恢复已在树中的订阅
+        fn hasClientSubscriptionsRecursive(self: *const Node, client_id: []const u8) bool {
+            // 检查当前节点的订阅者列表
+            for (self.subscribers.items) |client| {
+                if (std.mem.eql(u8, client.identifer, client_id)) {
+                    return true;
+                }
+            }
+
+            // 递归检查所有子节点
+            var it = self.children.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.hasClientSubscriptionsRecursive(client_id)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         fn deinit_deep(self: *Node, allocator: Allocator) void {
             var it = self.children.iterator();
             while (it.next()) |child| {
@@ -325,9 +347,23 @@ pub const SubscriptionTree = struct {
     }
 
     /// 恢复客户端的订阅(用于重连时从持久化存储恢复)
+    /// 检查主题树中是否存在指定客户端的订阅
+    /// 用于重连时判断是否需要从文件恢复订阅
+    /// 注意：此方法不加锁,调用者需要确保线程安全
+    pub fn hasClientSubscriptions(self: *SubscriptionTree, client_id: []const u8) bool {
+        return self.root.hasClientSubscriptionsRecursive(client_id);
+    }
+
     pub fn restoreClientSubscriptions(self: *SubscriptionTree, client: *Client) !void {
         if (self.persistence) |persistence| {
             const allocator = self.root.children.allocator;
+
+            // 优化：先检查主题树中是否已有订阅
+            // 如果主题树中已有该客户端的订阅(例如旧连接未正确断开),则无需从文件恢复
+            if (self.hasClientSubscriptions(client.identifer)) {
+                logger.info("Client '{s}' already has subscriptions in topic tree, skipping restore from file", .{client.identifer});
+                return;
+            }
 
             // 从持久化存储获取订阅
             var subscriptions_opt = try persistence.getClientSubscriptions(client.identifer, allocator);

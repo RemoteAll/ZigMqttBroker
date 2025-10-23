@@ -635,16 +635,32 @@ const ClientConnection = struct {
         self.is_disconnecting = true;
 
         self.state = .Disconnecting;
-        logger.info("Client {d} ({s}) disconnecting", .{ self.id, self.client.identifer });
+        logger.info("Client {d} ({s}) disconnecting (clean_start={})", .{ self.id, self.client.identifer, self.client.clean_start });
 
         // 记录连接关闭
         self.broker.metrics.incConnectionClosed();
+
+        // 标记客户端为已断开(但不立即释放)
+        self.client.is_connected = false;
+
+        // 根据 Clean Session 标志决定是否清理订阅
+        // [MQTT-3.1.2-6] Clean Session = 1: 断开时必须删除会话状态
+        // [MQTT-3.1.2-5] Clean Session = 0: 断开时保留会话状态
+        if (self.client.clean_start) {
+            // Clean Session = 1: 清理订阅(从主题树和持久化)
+            logger.info("Client {s} disconnecting with Clean Session = 1, clearing all subscriptions", .{self.client.identifer});
+            self.broker.subscriptions.unsubscribeAll(self.client);
+        } else {
+            // Clean Session = 0: 保留订阅,仅标记为离线
+            // 订阅仍在主题树中,但消息转发时会跳过(因为 is_connected = false)
+            logger.info("Client {s} disconnecting with Clean Session = 0, preserving subscriptions for reconnection", .{self.client.identifer});
+        }
 
         // 关闭 socket（这会取消所有待处理的 IO 操作）
         // 注意：关闭 socket 后，不应再有新的 IO 操作回调触发
         self.broker.io.close_socket(self.socket);
 
-        // 从 broker 移除客户端（使用 MQTT Client ID）
+        // 从 broker 移除客户端连接（使用 MQTT Client ID）
         // 注意：只有当前连接才移除，避免移除新的重连
         if (self.client.identifer.len > 0) {
             if (self.broker.clients.get(self.client.identifer)) |current_conn| {
@@ -656,7 +672,9 @@ const ClientConnection = struct {
         }
 
         // 清理资源
-        // 注意：此时 self 指针将失效，不能再使用
+        // 注意:如果 Clean Session = 0,Client 对象可能仍被主题树引用
+        // 这里释放会导致悬空指针,需要改进(引用计数或延迟清理)
+        // TODO: 实现引用计数或使用 Client ID 映射来避免悬空指针
         self.deinit(self.broker.allocator);
     }
 };
