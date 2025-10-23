@@ -137,10 +137,18 @@ const ClientConnection = struct {
         const length = result catch |err| {
             // 区分不同类型的错误
             switch (err) {
-                // 预期的正常断开错误 - 使用 INFO 级别
+                // 正常的断开/取消操作 - 使用 DEBUG 级别
+                error.OperationCancelled => {
+                    // CancelIoEx 取消的操作 - 这是我们主动调用的，完全正常
+                    logger.debug("Client {d} recv operation cancelled (normal disconnect)", .{self.id});
+                },
+                error.SocketNotConnected => {
+                    // Socket 已关闭或未连接 - 断开流程中的正常情况
+                    logger.debug("Client {d} recv error (socket not connected)", .{self.id});
+                },
                 error.Unexpected => {
-                    // Windows socket 关闭导致的 WSAENOTSOCK 错误
-                    logger.debug("Client {d} recv error (socket closed): {any}", .{ self.id, err });
+                    // Windows socket 关闭导致的其他错误
+                    logger.debug("Client {d} recv error (unexpected): {any}", .{ self.id, err });
                 },
                 error.ConnectionResetByPeer => {
                     // 客户端主动断开或网络中断 - 这是正常的
@@ -308,7 +316,22 @@ const ClientConnection = struct {
         // 发送 CONNACK
         try connect.connack(self.writer, &self.client.stream, reason_code, session_present);
         self.broker.metrics.incMessageSent(4); // CONNACK 固定4字节(包含字节统计)
-        logger.info("Client {d} ({s}) connected successfully", .{ self.id, self.client.identifer });
+
+        // 根据 Clean Session 标志判断连接类型
+        const connection_type = if (connect_packet.connect_flags.clean_session)
+            "NEW/CLEAN" // Clean Session = 1: 明确要求清除旧会话
+        else if (session_present)
+            "RECONNECT" // Clean Session = 0 且找到旧会话
+        else
+            "NEW/PERSISTENT"; // Clean Session = 0 但没有旧会话（首次连接或会话已过期）
+
+        logger.info("Client {d} ({s}) connected successfully [{s}] (CleanSession={}, SessionPresent={})", .{
+            self.id,
+            self.client.identifer,
+            connection_type,
+            connect_packet.connect_flags.clean_session,
+            session_present,
+        });
     }
 
     fn handleSubscribe(self: *ClientConnection) !void {

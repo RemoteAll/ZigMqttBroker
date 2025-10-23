@@ -139,6 +139,10 @@ pub fn read(reader: *packet.Reader, allocator: Allocator) !*ConnectPacket {
     const keep_alive = try reader.readTwoBytes();
     cp.keep_alive = keep_alive;
     std.debug.print("Keep Alive: {d}\n", .{cp.keep_alive});
+    std.debug.print("Clean Session: {} {s}\n", .{
+        cp.connect_flags.clean_session,
+        if (cp.connect_flags.clean_session) "(NEW connection/clear old session)" else "(RECONNECT/resume session)",
+    });
 
     // [MQTT-3.1.3-1] Payload processing based on flags set, the fields MUST appear in the order:
     // Client Identifier

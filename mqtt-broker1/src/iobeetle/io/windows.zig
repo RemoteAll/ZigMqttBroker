@@ -711,7 +711,7 @@ pub const IO = struct {
         return null; // No support for best-effort non-blocking synchronous send.
     }
 
-    pub const RecvError = posix.RecvFromError;
+    pub const RecvError = posix.RecvFromError || error{OperationCancelled};
 
     pub fn recv(
         self: *IO,
@@ -807,7 +807,8 @@ pub const IO = struct {
                         .WSAEOPNOTSUPP => unreachable, // we dont use MSG_OOB or MSG_PARTIAL
                         .WSAESHUTDOWN => error.SocketNotConnected,
                         .WSAETIMEDOUT => error.ConnectionRefused,
-                        .WSA_OPERATION_ABORTED => unreachable, // operation was cancelled
+                        .WSA_OPERATION_ABORTED => error.OperationCancelled, // CancelIoEx 取消的操作
+                        .WSAENOTSOCK => error.SocketNotConnected, // socket 已关闭（竞态条件）
                         else => |err| os.windows.unexpectedWSAError(err),
                     };
                 }
@@ -1125,6 +1126,20 @@ pub const IO = struct {
     /// Closes a socket opened by the IO instance.
     pub fn close_socket(self: *IO, socket: socket_t) void {
         _ = self;
+
+        // Windows: 在关闭 socket 前取消所有待处理的 IO 操作
+        // 这样可以避免在已关闭的 socket 上触发回调导致 WSAENOTSOCK (10038) 错误
+        // CancelIoEx 会让待处理的操作以 WSA_OPERATION_ABORTED 错误完成
+        const handle: os.windows.HANDLE = @ptrCast(socket);
+        _ = os.windows.kernel32.CancelIoEx(
+            handle,
+            null, // 取消该 socket 上的所有操作
+        );
+
+        // 给 IOCP 一点时间完成取消操作
+        // 这是一个简单的解决方案，更好的方式是引用计数
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+
         posix.close(socket);
     }
 
