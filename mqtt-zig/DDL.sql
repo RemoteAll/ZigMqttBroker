@@ -1,0 +1,7 @@
+CREATE TABLE IF NOT EXISTS pub_messages(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender_id TEXT NOT NULL,
+    pkt_id INTEGER NOT NULL,
+    topic TEXT NOT NULL,
+    payload BLOB NOT NULL
+);
