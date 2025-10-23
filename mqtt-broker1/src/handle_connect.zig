@@ -262,22 +262,17 @@ pub fn read(reader: *packet.Reader, allocator: Allocator) !*ConnectPacket {
     return cp;
 }
 
-pub fn connack(writer: *packet.Writer, stream: *net.Stream, reason_code: mqtt.ReasonCode) (packet.PacketWriterError || ConnectError || posix.WriteError)!void {
+pub fn connack(writer: *packet.Writer, stream: *net.Stream, reason_code: mqtt.ReasonCode, session_present: bool) (packet.PacketWriterError || ConnectError || posix.WriteError)!void {
     std.debug.print("--- CONNACK packet ---\n", .{});
 
     try writer.startPacket(mqtt.Command.CONNACK);
 
     // connection acknowledge
-    var connect_acknowledge: u8 = 0x00;
-    const session_present_bit = false;
-    const connect_acknowledge_flags: u8 = 0x00;
-    if (session_present_bit) {
-        connect_acknowledge = 1 << 0 | connect_acknowledge_flags;
-    } else {
-        connect_acknowledge = connect_acknowledge_flags;
-    }
+    // [MQTT-3.2.2-1] Session Present flag must be 0 if Clean Session is 1
+    // [MQTT-3.2.2-2] Session Present flag indicates if server has session state
+    const connect_acknowledge: u8 = if (session_present) 0x01 else 0x00;
     try writer.writeByte(connect_acknowledge);
-    std.debug.print("Connection acknowledge: {X}\n", .{connect_acknowledge});
+    std.debug.print("Connection acknowledge: {X} (session_present={})\n", .{ connect_acknowledge, session_present });
 
     // connection return / reason code
     try writer.writeByte(@intFromEnum(reason_code));

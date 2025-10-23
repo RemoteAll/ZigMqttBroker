@@ -331,7 +331,7 @@ const MqttBroker = struct {
 
                         // ack the connection and disconnect
                         logger.warn("{s} connection rejected: {any}", .{ client_name, reason_code });
-                        try connect.connack(writer, &client.stream, reason_code);
+                        try connect.connack(writer, &client.stream, reason_code, false);
                         logger.debug("Server sent CONNACK (rejection) to {s}", .{client_name});
                         return;
                     } else {
@@ -347,10 +347,17 @@ const MqttBroker = struct {
                         client.connect_time = time.milliTimestamp();
                         client.last_activity = client.connect_time;
 
+                        // 确定会话状态
+                        // [MQTT-3.2.2-1] 如果 Clean Session = 1, Session Present 必须为 0
+                        const session_present = if (connect_packet.connect_flags.clean_session)
+                            false
+                        else
+                            false; // TODO: 实现会话持久化后,检查是否有该客户端的会话状态
+
                         // ack the connection (重新获取 client_name,因为 identifer 已更新)
                         const client_name_updated = getClientDisplayName(client);
                         logger.info("{s} connected successfully (keep_alive={d}s, clean_session={any})", .{ client_name_updated, client.keep_alive, client.clean_start });
-                        try connect.connack(writer, &client.stream, reason_code);
+                        try connect.connack(writer, &client.stream, reason_code, session_present);
                         logger.debug("Server sent CONNACK to {s}", .{client_name_updated});
 
                         // 保留详细的客户端信息打印用于调试

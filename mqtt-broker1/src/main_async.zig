@@ -135,10 +135,23 @@ const ClientConnection = struct {
         }
 
         const length = result catch |err| {
-            // 只记录非预期的错误（排除因关闭 socket 导致的错误）
-            if (err != error.Unexpected) {
-                logger.err("Client {d} recv error: {any}", .{ self.id, err });
-                self.broker.metrics.incNetworkError();
+            // 区分不同类型的错误
+            switch (err) {
+                // 预期的正常断开错误 - 使用 INFO 级别
+                error.Unexpected => {
+                    // Windows socket 关闭导致的 WSAENOTSOCK 错误
+                    logger.debug("Client {d} recv error (socket closed): {any}", .{ self.id, err });
+                },
+                error.ConnectionResetByPeer => {
+                    // 客户端主动断开或网络中断 - 这是正常的
+                    logger.info("Client {d} ({s}) disconnected by peer", .{ self.id, self.client.identifer });
+                    self.broker.metrics.incNetworkError();
+                },
+                else => {
+                    // 其他非预期错误 - 使用 ERROR 级别
+                    logger.err("Client {d} recv error: {any}", .{ self.id, err });
+                    self.broker.metrics.incNetworkError();
+                },
             }
             self.disconnect();
             return;
@@ -265,7 +278,7 @@ const ClientConnection = struct {
             };
 
             // 发送 CONNACK 拒绝
-            try connect.connack(self.writer, &self.client.stream, reason_code);
+            try connect.connack(self.writer, &self.client.stream, reason_code, false);
             self.broker.metrics.incMessageSent(4); // CONNACK 固定4字节(包含字节统计)
             logger.warn("Client {d} connection rejected: {any}", .{ self.id, reason_code });
             self.disconnect();
@@ -284,8 +297,16 @@ const ClientConnection = struct {
         self.client.connect_time = time.milliTimestamp();
         self.client.last_activity = self.client.connect_time;
 
+        // 确定会话状态
+        // [MQTT-3.2.2-1] 如果 Clean Session = 1, Session Present 必须为 0
+        // [MQTT-3.2.2-2] 如果 Clean Session = 0, Session Present 取决于是否有保存的会话
+        const session_present = if (connect_packet.connect_flags.clean_session)
+            false // Clean Session = 1 时必须返回 false
+        else
+            false; // TODO: 实现会话持久化后,检查是否有该客户端的会话状态
+
         // 发送 CONNACK
-        try connect.connack(self.writer, &self.client.stream, reason_code);
+        try connect.connack(self.writer, &self.client.stream, reason_code, session_present);
         self.broker.metrics.incMessageSent(4); // CONNACK 固定4字节(包含字节统计)
         logger.info("Client {d} ({s}) connected successfully", .{ self.id, self.client.identifer });
     }
