@@ -95,6 +95,127 @@ const MqttBroker = struct {
         return id;
     }
 
+    /// 转发给单个订阅者(优化路径)
+    fn forwardToSingle(self: *MqttBroker, subscriber: *Client, publish_packet: anytype, writer: anytype) !void {
+        _ = self;
+        if (!subscriber.is_connected) {
+            logger.warn("   ⚠️  Skipping disconnected subscriber: {s}", .{subscriber.identifer});
+            return;
+        }
+
+        writer.reset();
+        try publish.writePublish(
+            writer,
+            publish_packet.topic,
+            publish_packet.payload,
+            .AtMostOnce,
+            publish_packet.retain,
+            false,
+            null,
+        );
+
+        writer.writeToStream(&subscriber.stream) catch |err| {
+            logger.err("   ❌ Failed to send to {s}: {any}", .{ subscriber.identifer, err });
+            return err;
+        };
+
+        logger.debug("   ✅ Forwarded to {s}", .{subscriber.identifer});
+    }
+
+    /// 顺序转发给多个订阅者(2-5个,避免线程开销)
+    fn forwardSequentially(self: *MqttBroker, subscribers: []*Client, publish_packet: anytype, writer: anytype) !void {
+        _ = self;
+        for (subscribers) |subscriber| {
+            if (!subscriber.is_connected) {
+                logger.warn("   ⚠️  Skipping disconnected subscriber: {s}", .{subscriber.identifer});
+                continue;
+            }
+
+            writer.reset();
+            try publish.writePublish(
+                writer,
+                publish_packet.topic,
+                publish_packet.payload,
+                .AtMostOnce,
+                publish_packet.retain,
+                false,
+                null,
+            );
+
+            writer.writeToStream(&subscriber.stream) catch |err| {
+                logger.err("   ❌ Failed to send to {s}: {any}", .{ subscriber.identifer, err });
+                continue;
+            };
+
+            logger.debug("   ✅ Forwarded to {s}", .{subscriber.identifer});
+        }
+    }
+
+    /// 并发转发给大量订阅者(>5个,使用线程池)
+    fn forwardConcurrently(self: *MqttBroker, subscribers: []*Client, publish_packet: anytype) !void {
+        // 预先序列化PUBLISH包(避免每个线程重复序列化)
+        const temp_writer = try packet.Writer.init(self.allocator);
+        defer temp_writer.deinit();
+
+        try publish.writePublish(
+            temp_writer,
+            publish_packet.topic,
+            publish_packet.payload,
+            .AtMostOnce,
+            publish_packet.retain,
+            false,
+            null,
+        );
+
+        const serialized_packet = temp_writer.buffer[0..temp_writer.pos];
+
+        // 创建共享的数据包缓冲区
+        const packet_copy = try self.allocator.dupe(u8, serialized_packet);
+        defer self.allocator.free(packet_copy);
+
+        // 使用线程批量发送
+        var threads = try self.allocator.alloc(std.Thread, subscribers.len);
+        defer self.allocator.free(threads);
+
+        var thread_count: usize = 0;
+        for (subscribers) |subscriber| {
+            if (!subscriber.is_connected) {
+                logger.warn("   ⚠️  Skipping disconnected subscriber: {s}", .{subscriber.identifer});
+                continue;
+            }
+
+            const ForwardContext = struct {
+                subscriber: *Client,
+                packet_data: []const u8,
+            };
+
+            const ctx = ForwardContext{
+                .subscriber = subscriber,
+                .packet_data = packet_copy,
+            };
+
+            threads[thread_count] = try std.Thread.spawn(.{}, forwardWorker, .{ctx});
+            thread_count += 1;
+        }
+
+        // 等待所有线程完成
+        for (threads[0..thread_count]) |thread| {
+            thread.join();
+        }
+
+        logger.debug("   ✅ Forwarded to {d} subscribers concurrently", .{thread_count});
+    }
+
+    /// 并发转发的工作线程
+    fn forwardWorker(ctx: anytype) void {
+        const stream = &ctx.subscriber.stream;
+        stream.writeAll(ctx.packet_data) catch |err| {
+            logger.err("   ❌ Failed to send to {s}: {any}", .{ ctx.subscriber.identifer, err });
+            return;
+        };
+        logger.debug("   ✅ Forwarded to {s}", .{ctx.subscriber.identifer});
+    }
+
     /// add a new client to the broker with a threaded event loop
     fn handleClient(self: *MqttBroker, client: *Client) !void {
         const writer = try packet.Writer.init(self.allocator);
@@ -280,35 +401,26 @@ const MqttBroker = struct {
 
                     logger.info("   📨 Found {d} matching subscriber(s)", .{matched_clients.items.len});
 
-                    // 转发消息给所有匹配的订阅者
-                    for (matched_clients.items) |subscriber| {
-                        // 跳过发布者自己 (no_local 逻辑已在 match 中处理)
-                        // 这里只需要确保客户端仍然连接
-                        if (!subscriber.is_connected) {
-                            logger.warn("   ⚠️  Skipping disconnected subscriber: {s}", .{subscriber.identifer});
-                            continue;
-                        }
+                    // 批量并发转发优化
+                    const start_forward = std.time.nanoTimestamp();
 
-                        // 构建转发的 PUBLISH 包
-                        writer.reset();
-                        try publish.writePublish(
-                            writer,
-                            publish_packet.topic,
-                            publish_packet.payload,
-                            .AtMostOnce, // 转发时默认使用 QoS 0 (简化实现)
-                            publish_packet.retain,
-                            false, // dup = false
-                            null, // QoS 0 不需要 packet_id
-                        );
-
-                        // 发送给订阅者
-                        writer.writeToStream(&subscriber.stream) catch |err| {
-                            logger.err("   ❌ Failed to send to {s}: {any}", .{ subscriber.identifer, err });
-                            continue;
-                        };
-
-                        logger.debug("   ✅ Forwarded to {s}", .{subscriber.identifer});
+                    if (matched_clients.items.len == 0) {
+                        // 无订阅者,跳过
+                    } else if (matched_clients.items.len == 1) {
+                        // 单个订阅者,直接同步发送
+                        try self.forwardToSingle(matched_clients.items[0], publish_packet, writer);
+                    } else if (matched_clients.items.len <= 5) {
+                        // 少量订阅者(2-5个),顺序发送(避免线程创建开销)
+                        try self.forwardSequentially(matched_clients.items, publish_packet, writer);
+                    } else {
+                        // 大量订阅者(>5个),并发发送
+                        try self.forwardConcurrently(matched_clients.items, publish_packet);
                     }
+
+                    const end_forward = std.time.nanoTimestamp();
+                    const forward_time_ns: i64 = @intCast(end_forward - start_forward);
+                    const forward_time_ms = @as(f64, @floatFromInt(forward_time_ns)) / 1_000_000.0;
+                    logger.debug("   ⏱️  Forward time: {d} ns ({d:.3} ms)", .{ forward_time_ns, forward_time_ms });
 
                     // 移动 reader 位置到末尾
                     reader.pos = reader.length;

@@ -2,6 +2,18 @@ const std = @import("std");
 const Client = @import("client.zig").Client;
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
+const logger = @import("logger.zig");
+
+/// 主题匹配缓存项
+const CacheEntry = struct {
+    clients: ArrayList(*Client),
+    /// 缓存版本号,用于无锁失效检测
+    version: usize,
+
+    fn deinit(self: *CacheEntry, allocator: Allocator) void {
+        self.clients.deinit(allocator);
+    }
+};
 
 // Subscription Tree maintains a list of MQTT subscribers and allows for efficient matching of topics to clients
 pub const SubscriptionTree = struct {
@@ -136,15 +148,71 @@ pub const SubscriptionTree = struct {
     };
 
     root: Node,
+    /// 主题匹配缓存: topic -> 匹配的客户端列表
+    match_cache: std.StringHashMap(CacheEntry),
+    /// 缓存版本号,每次订阅变更时递增(原子操作,无锁)
+    cache_version: std.atomic.Value(usize),
+    /// 缓存读写锁(读多写少场景优化)
+    cache_rwlock: std.Thread.RwLock,
+    /// 缓存统计(原子操作,无锁)
+    cache_hits: std.atomic.Value(usize),
+    cache_misses: std.atomic.Value(usize),
 
     pub fn init(allocator: Allocator) SubscriptionTree {
         return SubscriptionTree{
             .root = Node.init(allocator),
+            .match_cache = std.StringHashMap(CacheEntry).init(allocator),
+            .cache_version = std.atomic.Value(usize).init(0),
+            .cache_rwlock = .{},
+            .cache_hits = std.atomic.Value(usize).init(0),
+            .cache_misses = std.atomic.Value(usize).init(0),
         };
     }
 
     pub fn deinit(self: *SubscriptionTree) void {
         self.root.deinit_deep(self.root.children.allocator);
+
+        // 清理缓存
+        var it = self.match_cache.iterator();
+        while (it.next()) |entry| {
+            var cache_entry = entry.value_ptr;
+            cache_entry.deinit(self.match_cache.allocator);
+        }
+        self.match_cache.deinit();
+    }
+
+    /// 增加缓存版本号(订阅变更时调用)
+    fn bumpCacheVersion(self: *SubscriptionTree) void {
+        _ = self.cache_version.fetchAdd(1, .monotonic);
+        std.debug.print(">> Cache version bumped to {d}\n", .{self.cache_version.load(.monotonic)});
+    }
+
+    /// 清除过期缓存项(按需清理,避免全量清理)
+    fn cleanStaleCache(self: *SubscriptionTree) void {
+        self.cache_rwlock.lock();
+        defer self.cache_rwlock.unlock();
+
+        const current_version = self.cache_version.load(.monotonic);
+        var to_remove = ArrayList([]const u8).init(self.match_cache.allocator);
+        defer to_remove.deinit();
+
+        var it = self.match_cache.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.version < current_version) {
+                to_remove.append(entry.key_ptr.*) catch continue;
+            }
+        }
+
+        for (to_remove.items) |key| {
+            if (self.match_cache.fetchRemove(key)) |removed| {
+                var cache_entry = removed.value;
+                cache_entry.deinit(self.match_cache.allocator);
+            }
+        }
+
+        if (to_remove.items.len > 0) {
+            std.debug.print(">> Cleaned {d} stale cache entries\n", .{to_remove.items.len});
+        }
     }
 
     pub fn subscribe(self: *SubscriptionTree, topic: []const u8, client: *Client) !void {
@@ -164,6 +232,9 @@ pub const SubscriptionTree = struct {
 
         std.debug.print(">> subscribe() >> topic: '{s}', topic_levels: {any}\n", .{ topic, topic_levels.items });
         try self.root.subscribe(topic_levels.items, client, allocator);
+
+        // 订阅关系改变,增加版本号(缓存延迟失效)
+        self.bumpCacheVersion();
     }
 
     pub fn unsubscribe(self: *SubscriptionTree, topic: []const u8, client: *Client) !bool {
@@ -175,12 +246,59 @@ pub const SubscriptionTree = struct {
         defer allocator.free(topic_levels); // 释放 parseTopicLevels 分配的内存
 
         std.debug.print(">> unsubscribe() >> topic_levels: {any}\n", .{topic_levels});
-        return try self.root.unsubscribe(topic_levels, client, allocator);
+        const result = try self.root.unsubscribe(topic_levels, client, allocator);
+
+        // 取消订阅成功,增加版本号(缓存延迟失效)
+        if (result) {
+            self.bumpCacheVersion();
+        }
+
+        return result;
     }
 
-    /// 匹配订阅的客户端,支持去重和 no_local 过滤
+    /// 匹配订阅的客户端,支持去重、no_local 过滤和高性能缓存
     /// publisher_client_id: 发布消息的客户端 ID (MQTT 客户端标识符)
     pub fn match(self: *SubscriptionTree, topic: []const u8, publisher_client_id: ?[]const u8, allocator: *Allocator) !ArrayList(*Client) {
+        const current_version = self.cache_version.load(.monotonic);
+
+        // 总是尝试从缓存获取(no_local 后处理)
+        self.cache_rwlock.lockShared();
+        const cached_opt = self.match_cache.get(topic);
+
+        if (cached_opt) |cached| {
+            // 检查缓存版本是否有效
+            if (cached.version == current_version) {
+                _ = self.cache_hits.fetchAdd(1, .monotonic);
+                self.cache_rwlock.unlockShared();
+
+                const hits = self.cache_hits.load(.monotonic);
+                const misses = self.cache_misses.load(.monotonic);
+                logger.info(">> 📌 Cache HIT for topic: '{s}' (hits: {d}, misses: {d})", .{ topic, hits, misses });
+
+                // 返回缓存的副本,过滤已断开的客户端和 no_local
+                var result: ArrayList(*Client) = .{};
+                for (cached.clients.items) |client| {
+                    if (!client.is_connected) continue;
+
+                    // no_local 过滤
+                    if (publisher_client_id) |pub_id| {
+                        if (std.mem.eql(u8, client.identifer, pub_id) and client.hasNoLocal(topic)) {
+                            continue;
+                        }
+                    }
+
+                    try result.append(allocator.*, client);
+                }
+                return result;
+            }
+        }
+        self.cache_rwlock.unlockShared();
+
+        _ = self.cache_misses.fetchAdd(1, .monotonic);
+        const hits = self.cache_hits.load(.monotonic);
+        const misses = self.cache_misses.load(.monotonic);
+        logger.info(">> ❌ Cache MISS for topic: '{s}' (hits: {d}, misses: {d})", .{ topic, hits, misses });
+
         var matched_clients: ArrayList(*Client) = .{};
 
         // 解析主题层级(临时使用,不需要 dupe)
@@ -226,7 +344,44 @@ pub const SubscriptionTree = struct {
         }
 
         matched_clients.deinit(allocator.*);
+
+        // 总是将结果放入缓存(提高命中率,no_local 后处理)
+        if (deduplicated.items.len > 0) {
+            self.cache_rwlock.lock();
+            defer self.cache_rwlock.unlock();
+
+            // 复制结果到缓存
+            var cached_clients: ArrayList(*Client) = .{};
+            for (deduplicated.items) |client| {
+                try cached_clients.append(self.match_cache.allocator, client);
+            }
+
+            const topic_copy = try self.match_cache.allocator.dupe(u8, topic);
+            errdefer self.match_cache.allocator.free(topic_copy);
+
+            const cache_entry = CacheEntry{
+                .clients = cached_clients,
+                .version = current_version,
+            };
+
+            try self.match_cache.put(topic_copy, cache_entry);
+            std.debug.print(">> Cached result for topic: '{s}' ({d} clients, version: {d})\n", .{ topic, deduplicated.items.len, current_version });
+        }
+
         return deduplicated;
+    }
+
+    /// 获取缓存统计信息
+    pub fn getCacheStats(self: *SubscriptionTree) struct { hits: usize, misses: usize, size: usize, version: usize } {
+        self.cache_rwlock.lockShared();
+        defer self.cache_rwlock.unlockShared();
+
+        return .{
+            .hits = self.cache_hits.load(.monotonic),
+            .misses = self.cache_misses.load(.monotonic),
+            .size = self.match_cache.count(),
+            .version = self.cache_version.load(.monotonic),
+        };
     }
 
     fn parseTopicLevels(topic: []const u8, allocator: Allocator) ![][]const u8 {
