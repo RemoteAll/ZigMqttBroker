@@ -31,6 +31,16 @@ pub const SubscriptionTree = struct {
 
         pub fn subscribe(self: *Node, topic_levels: [][]const u8, client: *Client, allocator: Allocator) !void {
             if (topic_levels.len == 0) {
+                // 检查是否已订阅（避免重复增加引用计数）
+                for (self.subscribers.items) |existing_client| {
+                    if (existing_client.id == client.id) {
+                        std.debug.print(">> Client {s} already subscribed, skipping\n", .{client.identifer});
+                        return; // 已订阅，不重复添加
+                    }
+                }
+
+                // 新增订阅：增加引用计数
+                _ = client.retain();
                 try self.subscribers.append(allocator, client);
                 return;
             }
@@ -63,12 +73,21 @@ pub const SubscriptionTree = struct {
 
         pub fn unsubscribe(self: *Node, topic_levels: [][]const u8, client: *Client, allocator: Allocator) !bool {
             if (topic_levels.len == 0) {
-                // 到达目标层级,移除该客户端
+                // 到达目标层级,移除该客户端并释放引用
                 var found = false;
                 var i: usize = 0;
                 while (i < self.subscribers.items.len) {
                     if (self.subscribers.items[i].id == client.id) {
-                        _ = self.subscribers.swapRemove(i);
+                        const removed_client = self.subscribers.swapRemove(i);
+
+                        // 释放引用计数
+                        const should_cleanup = removed_client.release();
+                        if (should_cleanup) {
+                            std.debug.print(">> Client {s} can be safely cleaned up (ref_count=0)\n", .{removed_client.identifer});
+                            // 注意：这里不实际释放 Client 对象，因为它由 ClientConnection 的 Arena 管理
+                            // 只是标记可以安全清理
+                        }
+
                         found = true;
                         // 不增加 i,因为 swapRemove 会把最后一个元素移到当前位置
                         // 需要继续检查当前位置(如果有重复订阅的话)
@@ -102,11 +121,15 @@ pub const SubscriptionTree = struct {
 
         /// 从整个订阅树中移除指定客户端的所有订阅（递归）
         pub fn unsubscribeClientFromAll(self: *Node, client: *Client, allocator: Allocator) void {
-            // 从当前节点移除该客户端
+            // 从当前节点移除该客户端并释放引用
             var i: usize = 0;
             while (i < self.subscribers.items.len) {
                 if (self.subscribers.items[i].id == client.id) {
-                    _ = self.subscribers.swapRemove(i);
+                    const removed_client = self.subscribers.swapRemove(i);
+
+                    // 释放引用计数
+                    _ = removed_client.release();
+
                     continue;
                 }
                 i += 1;

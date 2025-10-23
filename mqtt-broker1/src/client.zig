@@ -27,6 +27,11 @@ pub const Client = struct {
     connect_time: i64,
     last_activity: i64,
 
+    // 引用计数：用于管理 Client 对象的生命周期
+    // 当订阅树、消息队列等持有 *Client 指针时会增加引用计数
+    // 只有引用计数为 0 时才能真正释放 Client 对象
+    ref_count: std.atomic.Value(u32),
+
     // MQTT session properties
     clean_start: bool,
     session_expiry_interval: u32,
@@ -161,6 +166,7 @@ pub const Client = struct {
             .is_connected = false,
             .connect_time = 0,
             .last_activity = 0,
+            .ref_count = std.atomic.Value(u32).init(1), // 初始引用计数为 1
             .clean_start = true,
             .session_expiry_interval = 0,
             .keep_alive = 0,
@@ -182,6 +188,33 @@ pub const Client = struct {
             .inflight_messages = std.AutoHashMap(u16, Message).init(allocator),
         };
         return client;
+    }
+
+    /// 增加引用计数（订阅树添加引用时调用）
+    /// 返回增加后的引用计数值
+    pub fn retain(self: *Client) u32 {
+        const old_count = self.ref_count.fetchAdd(1, .monotonic);
+        std.log.debug("Client {s} ref_count: {} -> {}", .{ self.identifer, old_count, old_count + 1 });
+        return old_count + 1;
+    }
+
+    /// 减少引用计数（订阅树移除引用时调用）
+    /// 返回 true 表示引用计数归零，可以安全释放
+    pub fn release(self: *Client) bool {
+        const old_count = self.ref_count.fetchSub(1, .monotonic);
+        std.log.debug("Client {s} ref_count: {} -> {}", .{ self.identifer, old_count, old_count - 1 });
+
+        if (old_count == 1) {
+            // 引用计数归零，可以安全释放
+            std.log.info("Client {s} ref_count reached 0, ready for cleanup", .{self.identifer});
+            return true;
+        }
+        return false;
+    }
+
+    /// 获取当前引用计数
+    pub fn getRefCount(self: *const Client) u32 {
+        return self.ref_count.load(.monotonic);
     }
 
     pub fn deinit(self: *Client) void {

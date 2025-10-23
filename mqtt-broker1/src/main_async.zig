@@ -103,7 +103,24 @@ const ClientConnection = struct {
     }
 
     pub fn deinit(self: *ClientConnection, base_allocator: Allocator) void {
-        // Arena会自动释放所有分配的内存
+        // 检查 Client 对象的引用计数
+        const ref_count = self.client.getRefCount();
+        if (ref_count > 0) {
+            // 警告：仍有其他引用（订阅树等）持有该 Client 指针
+            // 但由于使用 Arena 分配，Arena.deinit() 会释放所有内存
+            // 这会导致订阅树中的指针变成悬垂指针
+            logger.warn(
+                "Client {s} (#{}) still has {} reference(s) when deinit, potential dangling pointers!",
+                .{ self.client.identifer, self.client.id, ref_count },
+            );
+
+            // 解决方案：确保在 deinit 前调用 unsubscribeAll
+            // 或者实现延迟清理机制
+        } else {
+            logger.debug("Client {s} (#{}) can be safely freed (ref_count=0)", .{ self.client.identifer, self.client.id });
+        }
+
+        // Arena会自动释放所有分配的内存（包括 Client 对象）
         self.arena.deinit();
         base_allocator.destroy(self.arena);
     }
