@@ -296,13 +296,15 @@ pub const Client = struct {
 };
 
 // [MQTT-3.1.3-5] length and chars
+// 注意：此函数用于检查是否符合 MQTT 3.1.1 严格规范（1-23 字节，仅字母数字）
+// 实际使用中，我们允许更宽松的 ClientId（见 handle_connect.zig 中的处理）
 pub fn isValidClientId(client_id: []const u8) bool {
     // Check if the length is between 1 and 23 bytes
     if (client_id.len < 1 or client_id.len > 23) {
         return false;
     }
 
-    // Check if all characters are valid
+    // Check if all characters are valid (strict MQTT 3.1.1)
     for (client_id) |char| {
         switch (char) {
             '0'...'9', 'a'...'z', 'A'...'Z' => continue,
@@ -312,6 +314,40 @@ pub fn isValidClientId(client_id: []const u8) bool {
 
     // Check if the client_id is valid UTF-8
     return std.unicode.utf8ValidateSlice(client_id);
+}
+
+/// 宽松的 ClientId 验证，允许更多字符和更长的 ID
+/// 用于兼容各种云平台（阿里云 IoT、AWS IoT 等）的 ClientId 格式
+/// 允许字符：字母、数字、以及常见的特殊字符（-_:|.@）
+pub fn isValidClientIdRelaxed(client_id: []const u8) bool {
+    // 空 ID 无效
+    if (client_id.len == 0) {
+        return false;
+    }
+
+    // 检查是否是有效的 UTF-8
+    if (!std.unicode.utf8ValidateSlice(client_id)) {
+        return false;
+    }
+
+    // 允许字母、数字和常见的特殊字符
+    for (client_id) |char| {
+        switch (char) {
+            '0'...'9',
+            'a'...'z',
+            'A'...'Z',
+            '-',
+            '_',
+            ':',
+            '|',
+            '.',
+            '@',
+            => continue,
+            else => return false,
+        }
+    }
+
+    return true;
 }
 
 test "isValidClientId" {
@@ -324,4 +360,30 @@ test "isValidClientId" {
     try expect(!isValidClientId("tooLongClientIdAAAAAAAAA"));
     try expect(!isValidClientId("invalid-client-id"));
     try expect(!isValidClientId("emoji😊"));
+}
+
+test "isValidClientIdRelaxed" {
+    const expect = std.testing.expect;
+
+    // 基本的字母数字
+    try expect(isValidClientIdRelaxed("validClientId123"));
+    try expect(isValidClientIdRelaxed("a"));
+
+    // 允许的特殊字符
+    try expect(isValidClientIdRelaxed("GateWay|0HND9I2NIAT2A")); // 阿里云 IoT 格式
+    try expect(isValidClientIdRelaxed("client-id-with-dash"));
+    try expect(isValidClientIdRelaxed("client_id_with_underscore"));
+    try expect(isValidClientIdRelaxed("client:id:with:colon"));
+    try expect(isValidClientIdRelaxed("client.id.with.dot"));
+    try expect(isValidClientIdRelaxed("user@domain.com"));
+
+    // 长 ID（超过 23 字节）
+    try expect(isValidClientIdRelaxed("veryLongClientIdThatExceeds23Characters"));
+
+    // 无效的情况
+    try expect(!isValidClientIdRelaxed("")); // 空 ID
+    try expect(!isValidClientIdRelaxed("invalid client id")); // 空格不允许
+    try expect(!isValidClientIdRelaxed("emoji😊")); // emoji 不允许
+    try expect(!isValidClientIdRelaxed("id#with#hash")); // # 不允许
+    try expect(!isValidClientIdRelaxed("id$with$dollar")); // $ 不允许
 }

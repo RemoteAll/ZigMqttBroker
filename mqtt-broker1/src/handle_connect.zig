@@ -9,6 +9,7 @@ const mqtt = @import("mqtt.zig");
 const ConnectPacket = @import("mqtt/connect_packet.zig").ConnectPacket;
 const Client = @import("client.zig").Client;
 const isValidClientId = @import("client.zig").isValidClientId;
+const isValidClientIdRelaxed = @import("client.zig").isValidClientIdRelaxed;
 
 pub const ConnectError = error{
     InvalidPacket,
@@ -154,17 +155,22 @@ pub fn read(reader: *packet.Reader, allocator: Allocator) !*ConnectPacket {
     if (!std.unicode.utf8ValidateSlice(cp.client_identifier)) {
         try cp.addError(reader.getContextForError(ConnectError.ClientIdNotUTF8));
     }
-    // [MQTT-3.1.3-5]
-    if (!isValidClientId(cp.client_identifier)) {
-        // This server allows 2 char client ID min
 
+    // [MQTT-3.1.3-5] 使用宽松验证以支持云平台（阿里云 IoT、AWS IoT 等）
+    // 严格的 MQTT 3.1.1 规范要求 1-23 字节且仅字母数字，但大多数实现都放宽了这个限制
+    if (!isValidClientIdRelaxed(cp.client_identifier)) {
+        // 如果宽松验证也失败，检查具体原因
         if (cp.client_identifier.len < 2) {
             try cp.addError(reader.getContextForError(ConnectError.ClientIdTooShort));
-        }
-        // We also allow more than 23 characters for the client ID
-        if (cp.client_identifier.len > config.MAX_CLIENT_ID_LEN) {
+        } else if (cp.client_identifier.len > config.MAX_CLIENT_ID_LEN) {
             try cp.addError(reader.getContextForError(ConnectError.ClientIdTooLong));
+        } else {
+            // 包含不支持的字符
+            try cp.addError(reader.getContextForError(ConnectError.InvalidClientId));
         }
+    } else if (cp.client_identifier.len > config.MAX_CLIENT_ID_LEN) {
+        // 即使宽松验证通过，也要检查长度限制
+        try cp.addError(reader.getContextForError(ConnectError.ClientIdTooLong));
     }
 
     if (cp.client_identifier.len == 0 and !cp.connect_flags.clean_session) {
@@ -212,14 +218,6 @@ pub fn read(reader: *packet.Reader, allocator: Allocator) !*ConnectPacket {
         try cp.addError(reader.getContextForError(ConnectError.PasswordMustNotBeSet));
     }
 
-    // other flag Validation
-    if (cp.connect_flags.username != (cp.username != null)) {
-        try cp.addError(reader.getContextForError(ConnectError.UsernameFieldMismatch));
-    }
-    if (cp.connect_flags.password != (cp.password != null)) {
-        try cp.addError(reader.getContextForError(ConnectError.PasswordFieldMismatch));
-    }
-
     // Username
     if (cp.connect_flags.username) {
         cp.username = try reader.readUserName() orelse blk: {
@@ -243,6 +241,15 @@ pub fn read(reader: *packet.Reader, allocator: Allocator) !*ConnectPacket {
         if (cp.password == null or cp.password.?.len == 0) try cp.addError(reader.getContextForError(ConnectError.PasswordMustBePresent));
 
         std.debug.print("Password: '{?s}'\n", .{cp.password});
+    }
+
+    // Validate that username/password flags match the actual presence of fields
+    // This check must be done AFTER reading username and password
+    if (cp.connect_flags.username != (cp.username != null)) {
+        try cp.addError(reader.getContextForError(ConnectError.UsernameFieldMismatch));
+    }
+    if (cp.connect_flags.password != (cp.password != null)) {
+        try cp.addError(reader.getContextForError(ConnectError.PasswordFieldMismatch));
     }
 
     // After parsing all expected fields, check if there's any unexpected extra data in the packet:

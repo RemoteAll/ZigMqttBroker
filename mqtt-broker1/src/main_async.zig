@@ -58,6 +58,9 @@ const ClientConnection = struct {
     // Arena分配器用于此连接的所有内存分配
     arena: *ArenaAllocator,
 
+    // 防止重复断开连接
+    is_disconnecting: bool = false,
+
     pub fn init(
         base_allocator: Allocator,
         id: u64,
@@ -92,6 +95,7 @@ const ClientConnection = struct {
             .reader = packet.Reader.init(read_buffer),
             .writer = writer,
             .arena = arena,
+            .is_disconnecting = false,
         };
 
         return self;
@@ -124,9 +128,18 @@ const ClientConnection = struct {
     ) void {
         _ = completion;
 
+        // 如果已经在断开连接，忽略此回调
+        if (self.is_disconnecting) {
+            logger.debug("Client {d} recv callback ignored (already disconnecting)", .{self.id});
+            return;
+        }
+
         const length = result catch |err| {
-            logger.err("Client {d} recv error: {any}", .{ self.id, err });
-            self.broker.metrics.incNetworkError();
+            // 只记录非预期的错误（排除因关闭 socket 导致的错误）
+            if (err != error.Unexpected) {
+                logger.err("Client {d} recv error: {any}", .{ self.id, err });
+                self.broker.metrics.incNetworkError();
+            }
             self.disconnect();
             return;
         };
@@ -229,6 +242,11 @@ const ClientConnection = struct {
         const errors = connect_packet.getErrors();
         if (errors.len > 0) {
             logger.warn("Client {d} CONNECT has {d} errors", .{ self.id, errors.len });
+
+            // 输出所有错误的详细信息
+            for (errors, 0..) |packet_error, i| {
+                logger.warn("  Error {d}: {s} at byte position {d}", .{ i + 1, @errorName(packet_error.err), packet_error.byte_position });
+            }
 
             // 根据错误类型设置 reason_code
             reason_code = switch (errors[0].err) {
@@ -478,19 +496,28 @@ const ClientConnection = struct {
 
     /// 断开连接
     fn disconnect(self: *ClientConnection) void {
+        // 防止重复断开连接
+        if (self.is_disconnecting) {
+            return;
+        }
+        self.is_disconnecting = true;
+
         self.state = .Disconnecting;
         logger.info("Client {d} ({s}) disconnecting", .{ self.id, self.client.identifer });
 
         // 记录连接关闭
         self.broker.metrics.incConnectionClosed();
 
-        // 从 broker 移除客户端
-        _ = self.broker.clients.remove(self.id);
-
-        // 关闭 socket
+        // 关闭 socket（这会取消所有待处理的 IO 操作）
+        // 注意：关闭 socket 后，不应再有新的 IO 操作回调触发
         self.broker.io.close_socket(self.socket);
 
-        // 清理资源 (传递 base_allocator)
+        // 从 broker 移除客户端
+        // 这必须在关闭 socket 后执行，以确保不会有新的引用
+        _ = self.broker.clients.remove(self.id);
+
+        // 清理资源
+        // 注意：此时 self 指针将失效，不能再使用
         self.deinit(self.broker.allocator);
     }
 };
@@ -601,14 +628,27 @@ pub const MqttBroker = struct {
         logger.info("Entering event loop...", .{});
         while (true) {
             self.io.run() catch |err| {
-                logger.err("IO error: {any}", .{err});
-                break;
+                // IO 错误通常是由于已关闭的 socket 触发的，这是正常的断开流程
+                // 只记录非预期的严重错误，其他错误忽略以保持服务器运行
+                switch (err) {
+                    error.Unexpected => {
+                        // Socket 已关闭导致的 Unexpected 错误（如 WSAENOTSOCK）是正常的
+                        // 不需要记录，继续运行
+                        logger.debug("IO unexpected error (likely closed socket): {any}", .{err});
+                    },
+                    else => {
+                        // 其他严重错误才需要关注
+                        logger.err("IO critical error: {any}", .{err});
+                        // 继续运行而不是退出，让服务器保持可用
+                    },
+                }
             };
         }
     }
 
     /// 开始异步接受连接
     fn startAccept(self: *MqttBroker) void {
+        logger.debug("Starting accept operation (socket={any})...", .{self.server_socket});
         self.io.accept(
             *MqttBroker,
             self,
@@ -616,6 +656,7 @@ pub const MqttBroker = struct {
             &self.accept_completion,
             self.server_socket,
         );
+        logger.debug("Accept operation submitted", .{});
     }
 
     /// 启动统计定时器
@@ -656,6 +697,8 @@ pub const MqttBroker = struct {
     ) void {
         _ = completion;
 
+        logger.debug("Accept callback triggered", .{});
+
         const client_socket = result catch |err| {
             logger.err("Accept error: {any}", .{err});
             self.metrics.incNetworkError();
@@ -663,6 +706,8 @@ pub const MqttBroker = struct {
             self.startAccept();
             return;
         };
+
+        logger.info("Accepted socket: {any}", .{client_socket});
 
         // 检查连接数限制
         if (self.clients.count() >= config.MAX_CONNECTIONS) {
