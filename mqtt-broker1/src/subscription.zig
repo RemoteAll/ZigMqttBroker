@@ -99,6 +99,25 @@ pub const SubscriptionTree = struct {
             return false;
         }
 
+        /// 从整个订阅树中移除指定客户端的所有订阅（递归）
+        pub fn unsubscribeClientFromAll(self: *Node, client: *Client, allocator: Allocator) void {
+            // 从当前节点移除该客户端
+            var i: usize = 0;
+            while (i < self.subscribers.items.len) {
+                if (self.subscribers.items[i].id == client.id) {
+                    _ = self.subscribers.swapRemove(i);
+                    continue;
+                }
+                i += 1;
+            }
+
+            // 递归处理所有子节点
+            var it = self.children.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.unsubscribeClientFromAll(client, allocator);
+            }
+        }
+
         pub fn match(self: *Node, topic_levels: [][]const u8, matched_clients: *ArrayList(*Client), allocator: Allocator) !void {
             std.debug.print(">> Node.match() >> topic_levels.len={d}, subscribers.len={d}\n", .{ topic_levels.len, self.subscribers.items.len });
 
@@ -254,6 +273,17 @@ pub const SubscriptionTree = struct {
         }
 
         return result;
+    }
+
+    /// 取消客户端的所有订阅（用于 Clean Session = 1 时清理会话）
+    pub fn unsubscribeAll(self: *SubscriptionTree, client: *Client) void {
+        const allocator = self.root.children.allocator;
+        self.root.unsubscribeClientFromAll(client, allocator);
+        
+        // 订阅关系改变,增加版本号(缓存延迟失效)
+        self.bumpCacheVersion();
+        
+        logger.info("Unsubscribed all topics for client {s}", .{client.identifer});
     }
 
     /// 匹配订阅的客户端,支持去重、no_local 过滤和高性能缓存

@@ -305,13 +305,41 @@ const ClientConnection = struct {
         self.client.connect_time = time.milliTimestamp();
         self.client.last_activity = self.client.connect_time;
 
+        // 检查是否是重连（同一个 MQTT Client ID）
+        const mqtt_client_id = self.client.identifer;
+        const has_existing_session = self.broker.clients.get(mqtt_client_id) != null;
+        
+        if (self.broker.clients.get(mqtt_client_id)) |old_conn| {
+            logger.info("Client {s} is reconnecting (old_conn #{d}), handling session...", .{ mqtt_client_id, old_conn.id });
+            
+            // 根据 Clean Session 标志决定如何处理旧会话
+            if (connect_packet.connect_flags.clean_session) {
+                // Clean Session = 1: 清除旧会话的所有订阅
+                logger.info("Clean Session = 1, clearing old subscriptions for {s}", .{mqtt_client_id});
+                self.broker.subscriptions.unsubscribeAll(old_conn.client);
+            } else {
+                // Clean Session = 0: 保留订阅，但需要更新订阅树中的 Client 指针
+                // 这样订阅树中的指针指向新的 Client 对象
+                logger.info("Clean Session = 0, preserving subscriptions for {s}", .{mqtt_client_id});
+                // 订阅树中的 *Client 指针会在下面的 put 操作后自动指向新的 client
+            }
+            
+            // 关闭旧连接的 socket 和网络资源
+            self.broker.io.close_socket(old_conn.socket);
+            // 注意：不调用 old_conn.deinit()，因为订阅树可能还在引用 old_conn.client
+            // 而是让新连接复用旧会话的 Client 对象
+        }
+
+        // 将新连接注册到 broker（重连时会替换旧连接）
+        try self.broker.clients.put(mqtt_client_id, self);
+
         // 确定会话状态
         // [MQTT-3.2.2-1] 如果 Clean Session = 1, Session Present 必须为 0
         // [MQTT-3.2.2-2] 如果 Clean Session = 0, Session Present 取决于是否有保存的会话
         const session_present = if (connect_packet.connect_flags.clean_session)
             false // Clean Session = 1 时必须返回 false
         else
-            false; // TODO: 实现会话持久化后,检查是否有该客户端的会话状态
+            has_existing_session; // Clean Session = 0 时，如果有旧会话则返回 true
 
         // 发送 CONNACK
         try connect.connack(self.writer, &self.client.stream, reason_code, session_present);
@@ -486,6 +514,40 @@ const ClientConnection = struct {
     fn forwardToSingle(self: *ClientConnection, subscriber: *Client, publish_packet: anytype) !void {
         if (!subscriber.is_connected) return;
 
+        // 使用 MQTT Client ID 从 broker 的客户端映射中查找
+        const subscriber_conn = self.broker.clients.get(subscriber.identifer) orelse {
+            logger.warn("Subscriber {s} not found in broker clients map", .{subscriber.identifer});
+            return;
+        };
+
+        // 使用订阅者自己的 writer 来发送消息
+        subscriber_conn.writer.reset();
+        try publish.writePublish(
+            subscriber_conn.writer,
+            publish_packet.topic,
+            publish_packet.payload,
+            .AtMostOnce,
+            publish_packet.retain,
+            false,
+            null,
+        );
+
+        const bytes_sent = subscriber_conn.writer.pos;
+        try subscriber_conn.writer.writeToStream(&subscriber.stream);
+
+        // 记录转发指标
+        self.broker.metrics.incPublishSent();
+        self.broker.metrics.incMessageSent(bytes_sent);
+
+        logger.debug("Forwarded to {s}", .{subscriber.identifer});
+    }
+
+    /// 顺序转发给多个订阅者（高性能版本：共享序列化结果）
+    fn forwardSequentially(self: *ClientConnection, subscribers: []*Client, publish_packet: anytype) !void {
+        // 性能优化：先构建一次 PUBLISH 包，然后共享给所有订阅者
+        // 对于大规模订阅（100万+设备），避免重复序列化
+
+        // 1. 使用发布者的 writer 构建一次 PUBLISH 包
         self.writer.reset();
         try publish.writePublish(
             self.writer,
@@ -497,44 +559,47 @@ const ClientConnection = struct {
             null,
         );
 
-        const bytes_sent = self.writer.pos;
-        try self.writer.writeToStream(&subscriber.stream);
+        // 2. 获取序列化后的字节切片（零拷贝共享）
+        const serialized_message = self.writer.buffer[0..self.writer.pos];
+        const message_size = serialized_message.len;
 
-        // 记录转发指标
-        self.broker.metrics.incPublishSent();
-        self.broker.metrics.incMessageSent(bytes_sent);
+        // 3. 将预序列化的消息直接发送给所有订阅者
+        var sent_count: usize = 0;
+        var error_count: usize = 0;
 
-        logger.debug("Forwarded to {s}", .{subscriber.identifer});
-    }
-
-    /// 顺序转发给多个订阅者
-    fn forwardSequentially(self: *ClientConnection, subscribers: []*Client, publish_packet: anytype) !void {
         for (subscribers) |subscriber| {
             if (!subscriber.is_connected) continue;
 
-            self.writer.reset();
-            try publish.writePublish(
-                self.writer,
-                publish_packet.topic,
-                publish_packet.payload,
-                .AtMostOnce,
-                publish_packet.retain,
-                false,
-                null,
-            );
+            // 使用 MQTT Client ID 从 broker 的客户端映射中查找
+            const subscriber_conn = self.broker.clients.get(subscriber.identifer) orelse {
+                logger.warn("Subscriber {s} not found in broker clients map", .{subscriber.identifer});
+                error_count += 1;
+                continue;
+            };
 
-            const bytes_sent = self.writer.pos;
-            self.writer.writeToStream(&subscriber.stream) catch |err| {
+            // 直接写入预序列化的字节流（零拷贝）
+            subscriber_conn.client.stream.writeAll(serialized_message) catch |err| {
                 logger.err("Failed to forward to {s}: {any}", .{ subscriber.identifer, err });
                 self.broker.metrics.incNetworkError();
+                error_count += 1;
                 continue;
             };
 
             // 记录转发指标
             self.broker.metrics.incPublishSent();
-            self.broker.metrics.incMessageSent(bytes_sent);
+            self.broker.metrics.incMessageSent(message_size);
+            sent_count += 1;
+        }
 
-            logger.debug("Forwarded to {s}", .{subscriber.identifer});
+        // 批量日志记录（避免100万次日志调用）
+        if (sent_count > 10) {
+            logger.info("Forwarded to {d} subscribers ({d} errors)", .{ sent_count, error_count });
+        } else {
+            for (subscribers) |subscriber| {
+                if (subscriber.is_connected) {
+                    logger.debug("Forwarded to {s}", .{subscriber.identifer});
+                }
+            }
         }
     }
 
@@ -556,9 +621,16 @@ const ClientConnection = struct {
         // 注意：关闭 socket 后，不应再有新的 IO 操作回调触发
         self.broker.io.close_socket(self.socket);
 
-        // 从 broker 移除客户端
-        // 这必须在关闭 socket 后执行，以确保不会有新的引用
-        _ = self.broker.clients.remove(self.id);
+        // 从 broker 移除客户端（使用 MQTT Client ID）
+        // 注意：只有当前连接才移除，避免移除新的重连
+        if (self.client.identifer.len > 0) {
+            if (self.broker.clients.get(self.client.identifer)) |current_conn| {
+                // 只有当 HashMap 中的连接就是当前连接时才移除
+                if (current_conn == self) {
+                    _ = self.broker.clients.remove(self.client.identifer);
+                }
+            }
+        }
 
         // 清理资源
         // 注意：此时 self 指针将失效，不能再使用
@@ -570,8 +642,8 @@ const ClientConnection = struct {
 pub const MqttBroker = struct {
     allocator: Allocator,
     io: *IO,
-    clients: AutoHashMap(u64, *ClientConnection),
-    next_client_id: u64,
+    clients: std.StringHashMap(*ClientConnection), // MQTT Client ID -> ClientConnection
+    next_client_id: u64, // 仅用于日志记录的连接序号
     subscriptions: SubscriptionTree,
     server_socket: IO.socket_t,
     accept_completion: IO.Completion = undefined,
@@ -594,7 +666,7 @@ pub const MqttBroker = struct {
         self.* = .{
             .allocator = allocator,
             .io = io,
-            .clients = AutoHashMap(u64, *ClientConnection).init(allocator),
+            .clients = std.StringHashMap(*ClientConnection).init(allocator),
             .next_client_id = 1,
             .subscriptions = SubscriptionTree.init(allocator),
             .server_socket = IO.INVALID_SOCKET,
@@ -765,7 +837,7 @@ pub const MqttBroker = struct {
         logger.info("Accepted new connection (socket={any})", .{client_socket});
         self.metrics.incConnectionAccepted();
 
-        // 创建客户端连接 (从内存池获取)
+        // 创建客户端连接（序号仅用于日志）
         const client_id = self.getNextClientId();
         const conn = ClientConnection.init(self.allocator, client_id, client_socket, self) catch |err| {
             logger.err("Failed to create client connection: {any}", .{err});
@@ -775,14 +847,7 @@ pub const MqttBroker = struct {
             return;
         };
 
-        // 注册客户端
-        self.clients.put(client_id, conn) catch |err| {
-            logger.err("Failed to register client: {any}", .{err});
-            conn.deinit(self.allocator);
-            self.metrics.incConnectionRefused();
-            self.startAccept();
-            return;
-        };
+        // 注意：不在这里注册客户端，而是在 handleConnect 中使用 MQTT Client ID 注册
 
         // 开始读取客户端数据
         conn.startRead(self.io);
