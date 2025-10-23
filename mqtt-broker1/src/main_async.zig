@@ -9,6 +9,7 @@ const subscribe = @import("handle_subscribe.zig");
 const unsubscribe = @import("handle_unsubscribe.zig");
 const publish = @import("handle_publish.zig");
 const logger = @import("logger.zig");
+const Metrics = @import("metrics.zig").Metrics;
 const assert = std.debug.assert;
 const net = std.net;
 const mem = std.mem;
@@ -16,11 +17,15 @@ const time = std.time;
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const AutoHashMap = std.AutoHashMap;
+const ArenaAllocator = std.heap.ArenaAllocator;
 
 const Client = @import("client.zig").Client;
 
 // 导入 iobeetle IO 模块
 const IO = @import("iobeetle/io.zig").IO;
+
+// MemoryPool 类型定义
+const ClientConnectionPool = std.heap.MemoryPoolExtra(ClientConnection, .{ .growable = false });
 
 /// 客户端连接状态机
 const ConnectionState = enum {
@@ -50,28 +55,32 @@ const ClientConnection = struct {
     reader: packet.Reader,
     writer: *packet.Writer,
 
-    allocator: Allocator,
+    // Arena分配器用于此连接的所有内存分配
+    arena: *ArenaAllocator,
 
     pub fn init(
-        allocator: Allocator,
+        base_allocator: Allocator,
         id: u64,
         socket: IO.socket_t,
         broker: *MqttBroker,
     ) !*ClientConnection {
-        const self = try allocator.create(ClientConnection);
-        errdefer allocator.destroy(self);
+        // 创建Arena分配器
+        const arena = try base_allocator.create(ArenaAllocator);
+        errdefer base_allocator.destroy(arena);
+        arena.* = ArenaAllocator.init(base_allocator);
+
+        const arena_allocator = arena.allocator();
+
+        const self = try arena_allocator.create(ClientConnection);
 
         // 创建 Client 实例(临时使用空地址和流)
         const dummy_address = try net.Address.parseIp("0.0.0.0", 0);
         const dummy_stream = net.Stream{ .handle = socket };
-        const client = try Client.init(allocator, id, mqtt.ProtocolVersion.Invalid, dummy_stream, dummy_address);
-        errdefer client.deinit();
+        const client = try Client.init(arena_allocator, id, mqtt.ProtocolVersion.Invalid, dummy_stream, dummy_address);
 
-        const read_buffer = try allocator.alloc(u8, config.READ_BUFFER_SIZE);
-        errdefer allocator.free(read_buffer);
+        const read_buffer = try arena_allocator.alloc(u8, config.READ_BUFFER_SIZE);
 
-        const writer = try packet.Writer.init(allocator);
-        errdefer writer.deinit();
+        const writer = try packet.Writer.init(arena_allocator);
 
         self.* = .{
             .id = id,
@@ -82,17 +91,16 @@ const ClientConnection = struct {
             .read_buffer = read_buffer,
             .reader = packet.Reader.init(read_buffer),
             .writer = writer,
-            .allocator = allocator,
+            .arena = arena,
         };
 
         return self;
     }
 
-    pub fn deinit(self: *ClientConnection) void {
-        self.client.deinit();
-        self.allocator.free(self.read_buffer);
-        self.writer.deinit();
-        self.allocator.destroy(self);
+    pub fn deinit(self: *ClientConnection, base_allocator: Allocator) void {
+        // Arena会自动释放所有分配的内存
+        self.arena.deinit();
+        base_allocator.destroy(self.arena);
     }
 
     /// 开始异步读取数据
@@ -118,6 +126,7 @@ const ClientConnection = struct {
 
         const length = result catch |err| {
             logger.err("Client {d} recv error: {any}", .{ self.id, err });
+            self.broker.metrics.incNetworkError();
             self.disconnect();
             return;
         };
@@ -130,12 +139,16 @@ const ClientConnection = struct {
 
         logger.debug("Client {d} received {d} bytes", .{ self.id, length });
 
+        // 更新指标
+        self.broker.metrics.incMessageReceived(length);
+
         // 更新客户端活动时间
         self.client.updateActivity();
 
         // 处理接收到的数据
         self.reader.start(length) catch |err| {
             logger.err("Client {d} reader.start error: {any}", .{ self.id, err });
+            self.broker.metrics.incProtocolError();
             self.disconnect();
             return;
         };
@@ -143,6 +156,7 @@ const ClientConnection = struct {
         // 解析并处理 MQTT 包
         self.processPackets() catch |err| {
             logger.err("Client {d} process error: {any}", .{ self.id, err });
+            self.broker.metrics.incProtocolError();
             self.disconnect();
             return;
         };
@@ -207,7 +221,7 @@ const ClientConnection = struct {
     fn handleConnect(self: *ClientConnection) !void {
         var reason_code = mqtt.ReasonCode.MalformedPacket;
 
-        const connect_packet = connect.read(&self.reader, self.allocator) catch |err| {
+        const connect_packet = connect.read(&self.reader, self.arena.allocator()) catch |err| {
             logger.err("Client {d} CONNECT parse error: {any}", .{ self.id, err });
             return;
         };
@@ -234,6 +248,7 @@ const ClientConnection = struct {
 
             // 发送 CONNACK 拒绝
             try connect.connack(self.writer, &self.client.stream, reason_code);
+            self.broker.metrics.incMessageSent(4); // CONNACK 固定4字节(包含字节统计)
             logger.warn("Client {d} connection rejected: {any}", .{ self.id, reason_code });
             self.disconnect();
             return;
@@ -243,7 +258,7 @@ const ClientConnection = struct {
         reason_code = mqtt.ReasonCode.Success;
 
         // 设置客户端信息
-        self.client.identifer = try self.allocator.dupe(u8, connect_packet.client_identifier);
+        self.client.identifer = try self.arena.allocator().dupe(u8, connect_packet.client_identifier);
         self.client.protocol_version = mqtt.ProtocolVersion.fromU8(connect_packet.protocol_version);
         self.client.keep_alive = connect_packet.keep_alive;
         self.client.clean_start = connect_packet.connect_flags.clean_session;
@@ -253,24 +268,32 @@ const ClientConnection = struct {
 
         // 发送 CONNACK
         try connect.connack(self.writer, &self.client.stream, reason_code);
+        self.broker.metrics.incMessageSent(4); // CONNACK 固定4字节(包含字节统计)
         logger.info("Client {d} ({s}) connected successfully", .{ self.id, self.client.identifer });
     }
 
     fn handleSubscribe(self: *ClientConnection) !void {
-        const subscribe_packet = try subscribe.read(&self.reader, self.client, self.allocator);
+        const subscribe_packet = try subscribe.read(&self.reader, self.client, self.arena.allocator());
 
         logger.debug("Client {d} SUBSCRIBE {d} topics", .{ self.id, subscribe_packet.topics.items.len });
 
         for (subscribe_packet.topics.items) |topic| {
             try self.broker.subscriptions.subscribe(topic.filter, self.client);
+            self.broker.metrics.incSubscription();
             logger.info("Client {d} ({s}) subscribed to: {s}", .{ self.id, self.client.identifer, topic.filter });
         }
 
         try subscribe.suback(self.writer, &self.client.stream, subscribe_packet.packet_id, self.client);
+        // SUBACK: 固定头(2) + 包ID(2) + 返回码(topics数量)
+        const suback_size = 2 + 2 + subscribe_packet.topics.items.len;
+        self.broker.metrics.incMessageSent(suback_size); // 包含字节统计
     }
 
     fn handlePublish(self: *ClientConnection) !void {
         const publish_packet = try publish.read(&self.reader);
+
+        // 更新指标
+        self.broker.metrics.incPublishReceived();
 
         logger.info("Client {d} ({s}) published to '{s}' ({d} bytes)", .{
             self.id,
@@ -285,27 +308,30 @@ const ClientConnection = struct {
             .AtLeastOnce => {
                 if (publish_packet.packet_id) |pid| {
                     try publish.sendPuback(self.writer, self.client, pid);
+                    self.broker.metrics.incMessageSent(4); // PUBACK 固定4字节(包含字节统计)
                 }
             },
             .ExactlyOnce => {
                 if (publish_packet.packet_id) |pid| {
                     try publish.sendPubrec(self.writer, self.client, pid);
+                    self.broker.metrics.incMessageSent(4); // PUBREC 固定4字节(包含字节统计)
                 }
             },
         }
 
         // 转发给订阅者
+        var arena_allocator = self.arena.allocator();
         var matched_clients = try self.broker.subscriptions.match(
             publish_packet.topic,
             self.client.identifer,
-            &self.allocator,
+            &arena_allocator,
         );
-        defer matched_clients.deinit(self.allocator);
+        defer matched_clients.deinit(arena_allocator);
 
         if (matched_clients.items.len > 0) {
             logger.debug("Forwarding to {d} subscribers", .{matched_clients.items.len});
 
-            // 使用智能转发策略
+            // 使用智能转发策略(metrics在forward函数内部更新)
             if (matched_clients.items.len == 1) {
                 try self.forwardToSingle(matched_clients.items[0], publish_packet);
             } else {
@@ -315,10 +341,11 @@ const ClientConnection = struct {
     }
 
     fn handleUnsubscribe(self: *ClientConnection) !void {
-        const unsubscribe_packet = try unsubscribe.read(&self.reader, self.allocator);
+        const unsubscribe_packet = try unsubscribe.read(&self.reader, self.arena.allocator());
 
         for (unsubscribe_packet.topics.items) |topic_filter| {
             _ = try self.broker.subscriptions.unsubscribe(topic_filter, self.client);
+            self.broker.metrics.decSubscription();
             logger.info("Client {d} ({s}) unsubscribed from: {s}", .{ self.id, self.client.identifer, topic_filter });
         }
 
@@ -356,10 +383,13 @@ const ClientConnection = struct {
         try self.writer.writeTwoBytes(packet_id);
         try self.writer.writeToStream(&self.client.stream);
 
+        // 记录发送的 PUBREL 消息
+        self.broker.metrics.incMessageSent(4);
+
         logger.debug("Client {d} sent PUBREL for packet {d}", .{ self.id, packet_id });
     }
 
-    /// 处理 PUBREL (QoS 2 发布释放 - 第二步，来自客户端)
+    /// 处理 PUBREL (QoS 2 发布释放 - 第二步,来自客户端)
     fn handlePubrel(self: *ClientConnection) !void {
         // 读取 packet_id (2 字节)
         const packet_id = try self.reader.readTwoBytes();
@@ -371,6 +401,9 @@ const ClientConnection = struct {
         try self.writer.writeByte(2); // Remaining length = 2 (packet_id)
         try self.writer.writeTwoBytes(packet_id);
         try self.writer.writeToStream(&self.client.stream);
+
+        // 记录发送的 PUBCOMP 消息
+        self.broker.metrics.incMessageSent(4);
 
         logger.debug("Client {d} sent PUBCOMP for packet {d}", .{ self.id, packet_id });
 
@@ -402,7 +435,13 @@ const ClientConnection = struct {
             null,
         );
 
+        const bytes_sent = self.writer.pos;
         try self.writer.writeToStream(&subscriber.stream);
+
+        // 记录转发指标
+        self.broker.metrics.incPublishSent();
+        self.broker.metrics.incMessageSent(bytes_sent);
+
         logger.debug("Forwarded to {s}", .{subscriber.identifer});
     }
 
@@ -422,10 +461,16 @@ const ClientConnection = struct {
                 null,
             );
 
+            const bytes_sent = self.writer.pos;
             self.writer.writeToStream(&subscriber.stream) catch |err| {
                 logger.err("Failed to forward to {s}: {any}", .{ subscriber.identifer, err });
+                self.broker.metrics.incNetworkError();
                 continue;
             };
+
+            // 记录转发指标
+            self.broker.metrics.incPublishSent();
+            self.broker.metrics.incMessageSent(bytes_sent);
 
             logger.debug("Forwarded to {s}", .{subscriber.identifer});
         }
@@ -436,14 +481,17 @@ const ClientConnection = struct {
         self.state = .Disconnecting;
         logger.info("Client {d} ({s}) disconnecting", .{ self.id, self.client.identifer });
 
+        // 记录连接关闭
+        self.broker.metrics.incConnectionClosed();
+
         // 从 broker 移除客户端
         _ = self.broker.clients.remove(self.id);
 
         // 关闭 socket
         self.broker.io.close_socket(self.socket);
 
-        // 清理资源
-        self.deinit();
+        // 清理资源 (传递 base_allocator)
+        self.deinit(self.broker.allocator);
     }
 };
 
@@ -457,9 +505,19 @@ pub const MqttBroker = struct {
     server_socket: IO.socket_t,
     accept_completion: IO.Completion = undefined,
 
+    // 新增字段: 内存池、统计定时器、指标
+    client_pool: ClientConnectionPool,
+    stats_completion: IO.Completion = undefined,
+    metrics: Metrics,
+
     pub fn init(allocator: Allocator) !*MqttBroker {
         const io = try allocator.create(IO);
-        io.* = try IO.init(256, 0); // 256 个并发 IO 操作
+        io.* = try IO.init(config.IO_ENTRIES, 0);
+
+        // 创建并预热客户端连接池
+        var client_pool = ClientConnectionPool.init(allocator);
+        try client_pool.preheat(config.MAX_CLIENTS_POOL);
+        logger.info("Client pool preheated with {d} connections", .{config.MAX_CLIENTS_POOL});
 
         const self = try allocator.create(MqttBroker);
         self.* = .{
@@ -469,18 +527,25 @@ pub const MqttBroker = struct {
             .next_client_id = 1,
             .subscriptions = SubscriptionTree.init(allocator),
             .server_socket = IO.INVALID_SOCKET,
+            .client_pool = client_pool,
+            .metrics = Metrics.init(),
         };
 
         return self;
     }
 
     pub fn deinit(self: *MqttBroker) void {
+        logger.info("Shutting down MQTT broker...", .{});
+
+        // 输出最终统计信息
+        self.metrics.logStats();
+
         // 清理所有客户端连接
         var it = self.clients.iterator();
         while (it.next()) |entry| {
             const conn = entry.value_ptr.*;
             self.io.close_socket(conn.socket);
-            conn.deinit();
+            conn.deinit(self.allocator);
         }
         self.clients.deinit();
 
@@ -490,9 +555,15 @@ pub const MqttBroker = struct {
         }
 
         self.subscriptions.deinit();
+
+        // 清理内存池
+        self.client_pool.deinit();
+
         self.io.deinit();
         self.allocator.destroy(self.io);
         self.allocator.destroy(self);
+
+        logger.info("MQTT broker shutdown complete", .{});
     }
 
     /// 启动异步 MQTT Broker
@@ -523,6 +594,9 @@ pub const MqttBroker = struct {
         // 开始接受连接
         self.startAccept();
 
+        // 启动统计定时器
+        self.startStatsRoutine();
+
         // 进入事件循环
         logger.info("Entering event loop...", .{});
         while (true) {
@@ -544,6 +618,36 @@ pub const MqttBroker = struct {
         );
     }
 
+    /// 启动统计定时器
+    fn startStatsRoutine(self: *MqttBroker) void {
+        self.io.timeout(
+            *MqttBroker,
+            self,
+            onStatsTimeout,
+            &self.stats_completion,
+            config.STATS_INTERVAL_NS,
+        );
+    }
+
+    /// 统计定时器回调
+    fn onStatsTimeout(
+        self: *MqttBroker,
+        completion: *IO.Completion,
+        result: IO.TimeoutError!void,
+    ) void {
+        _ = completion;
+        _ = result catch |err| {
+            logger.err("Stats timeout error: {any}", .{err});
+            return;
+        };
+
+        // 输出统计信息
+        self.metrics.logStats();
+
+        // 重新启动定时器
+        self.startStatsRoutine();
+    }
+
     /// accept 完成回调
     fn onAcceptComplete(
         self: *MqttBroker,
@@ -554,18 +658,30 @@ pub const MqttBroker = struct {
 
         const client_socket = result catch |err| {
             logger.err("Accept error: {any}", .{err});
+            self.metrics.incNetworkError();
             // 继续接受新连接
             self.startAccept();
             return;
         };
 
-        logger.info("Accepted new connection (socket={any})", .{client_socket});
+        // 检查连接数限制
+        if (self.clients.count() >= config.MAX_CONNECTIONS) {
+            logger.warn("Connection limit reached ({d}), refusing new connection", .{config.MAX_CONNECTIONS});
+            self.metrics.incConnectionRefused();
+            self.io.close_socket(client_socket);
+            self.startAccept();
+            return;
+        }
 
-        // 创建客户端连接
+        logger.info("Accepted new connection (socket={any})", .{client_socket});
+        self.metrics.incConnectionAccepted();
+
+        // 创建客户端连接 (从内存池获取)
         const client_id = self.getNextClientId();
         const conn = ClientConnection.init(self.allocator, client_id, client_socket, self) catch |err| {
             logger.err("Failed to create client connection: {any}", .{err});
             self.io.close_socket(client_socket);
+            self.metrics.incConnectionRefused();
             self.startAccept();
             return;
         };
@@ -573,7 +689,8 @@ pub const MqttBroker = struct {
         // 注册客户端
         self.clients.put(client_id, conn) catch |err| {
             logger.err("Failed to register client: {any}", .{err});
-            conn.deinit();
+            conn.deinit(self.allocator);
+            self.metrics.incConnectionRefused();
             self.startAccept();
             return;
         };
