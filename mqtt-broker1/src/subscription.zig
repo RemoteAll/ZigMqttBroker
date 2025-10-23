@@ -202,6 +202,28 @@ pub const SubscriptionTree = struct {
             return false;
         }
 
+        /// 递归替换订阅树中的 Client 指针
+        /// 返回替换的数量
+        fn replaceClientPointerRecursive(self: *Node, old_client: *Client, new_client: *Client) usize {
+            var count: usize = 0;
+
+            // 替换当前节点的订阅者
+            for (self.subscribers.items) |*client_ptr| {
+                if (client_ptr.* == old_client) {
+                    client_ptr.* = new_client;
+                    count += 1;
+                }
+            }
+
+            // 递归处理所有子节点
+            var it = self.children.iterator();
+            while (it.next()) |entry| {
+                count += entry.value_ptr.replaceClientPointerRecursive(old_client, new_client);
+            }
+
+            return count;
+        }
+
         fn deinit_deep(self: *Node, allocator: Allocator) void {
             var it = self.children.iterator();
             while (it.next()) |child| {
@@ -413,6 +435,22 @@ pub const SubscriptionTree = struct {
                 logger.debug("No persisted subscriptions found for client '{s}'", .{client.identifer});
             }
         }
+    }
+
+    /// 替换订阅树中的 Client 指针
+    /// 用于 Clean Session = 0 断开时将 Client 对象从 Arena 转移到全局 allocator
+    /// 遍历整个订阅树，将所有指向 old_client 的引用替换为 new_client
+    pub fn replaceClientPointer(self: *SubscriptionTree, old_client: *Client, new_client: *Client) !void {
+        const replaced_count = self.root.replaceClientPointerRecursive(old_client, new_client);
+
+        if (replaced_count > 0) {
+            logger.info("Replaced {} client pointer(s) in subscription tree for client {s}", .{ replaced_count, old_client.identifer });
+        } else {
+            logger.warn("No client pointers found to replace for client {s}", .{old_client.identifer});
+        }
+
+        // 清除缓存，因为 Client 指针已变化
+        self.bumpCacheVersion();
     }
 
     /// 匹配订阅的客户端,支持去重、no_local 过滤和高性能缓存
