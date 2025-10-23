@@ -22,14 +22,30 @@ pub const SubscriptionTree = struct {
                 return;
             }
 
-            const child = try self.children.getOrPut(topic_levels[0]);
-            if (!child.found_existing) {
-                child.value_ptr.* = Node{
+            const current_level = topic_levels[0];
+            std.debug.print(">> Node.subscribe() >> current_level: '{s}'\n", .{current_level});
+
+            // 先尝试获取已存在的节点
+            if (self.children.getPtr(current_level)) |child| {
+                std.debug.print(">> Found existing node for '{s}'\n", .{current_level});
+                try child.subscribe(topic_levels[1..], client, allocator);
+            } else {
+                // 节点不存在,创建新节点并复制键
+                const key_copy = try self.children.allocator.dupe(u8, current_level);
+                errdefer self.children.allocator.free(key_copy);
+
+                const new_node = Node{
                     .children = std.StringHashMap(Node).init(self.children.allocator),
                     .subscribers = .{},
                 };
+
+                try self.children.put(key_copy, new_node);
+                std.debug.print(">> Created new node for '{s}'\n", .{key_copy});
+
+                // 递归订阅下一层
+                const child_ptr = self.children.getPtr(key_copy).?;
+                try child_ptr.subscribe(topic_levels[1..], client, allocator);
             }
-            try child.value_ptr.subscribe(topic_levels[1..], client, allocator);
         }
 
         pub fn unsubscribe(self: *Node, topic_levels: [][]const u8, client: *Client, allocator: Allocator) !bool {
@@ -72,16 +88,23 @@ pub const SubscriptionTree = struct {
         }
 
         pub fn match(self: *Node, topic_levels: [][]const u8, matched_clients: *ArrayList(*Client), allocator: Allocator) !void {
+            std.debug.print(">> Node.match() >> topic_levels.len={d}, subscribers.len={d}\n", .{ topic_levels.len, self.subscribers.items.len });
+
             // 如果没有更多层级，收集当前节点的订阅者
             if (topic_levels.len == 0) {
+                std.debug.print(">> Reached end of topic, adding {d} subscribers\n", .{self.subscribers.items.len});
                 for (self.subscribers.items) |client| {
                     try matched_clients.append(allocator, client);
                 }
                 return;
             }
 
+            const current_level = topic_levels[0];
+            std.debug.print(">> Matching level: '{s}'\n", .{current_level});
+
             // 1. 处理多级通配符 '#' (匹配所有剩余层级)
-            if (self.children.get("#")) |wildcard_child| {
+            if (self.children.getPtr("#")) |wildcard_child| {
+                std.debug.print(">> Found '#' wildcard, adding {d} subscribers\n", .{wildcard_child.subscribers.items.len});
                 // '#' 匹配当前层级和所有子层级，直接收集订阅者
                 for (wildcard_child.subscribers.items) |client| {
                     try matched_clients.append(allocator, client);
@@ -89,13 +112,17 @@ pub const SubscriptionTree = struct {
             }
 
             // 2. 处理单级通配符 '+' (只匹配当前层级)
-            if (self.children.get("+")) |plus_child| {
+            if (self.children.getPtr("+")) |plus_child| {
+                std.debug.print(">> Found '+' wildcard\n", .{});
                 try plus_child.match(topic_levels[1..], matched_clients, allocator);
             }
 
             // 3. 精确匹配当前层级
-            if (self.children.get(topic_levels[0])) |child| {
+            if (self.children.getPtr(current_level)) |child| {
+                std.debug.print(">> Found exact match for '{s}'\n", .{current_level});
                 try child.match(topic_levels[1..], matched_clients, allocator);
+            } else {
+                std.debug.print(">> No match found for '{s}'\n", .{current_level});
             }
         }
         fn deinit_deep(self: *Node, allocator: Allocator) void {
@@ -125,11 +152,18 @@ pub const SubscriptionTree = struct {
         try validateTopicFilter(topic);
 
         const allocator = self.root.children.allocator;
-        const topic_levels = try parseTopicLevels(topic, allocator);
-        defer allocator.free(topic_levels); // 释放 parseTopicLevels 分配的内存
 
-        std.debug.print(">> subscribe() >> topic_levels: {any}\n", .{topic_levels});
-        try self.root.subscribe(topic_levels, client, allocator);
+        // 解析主题层级(不需要 dupe,因为 getOrPut 会复制键)
+        var topic_levels: ArrayList([]const u8) = .{};
+        defer topic_levels.deinit(allocator);
+
+        var iterator = std.mem.splitScalar(u8, topic, '/');
+        while (iterator.next()) |level| {
+            try topic_levels.append(allocator, level);
+        }
+
+        std.debug.print(">> subscribe() >> topic: '{s}', topic_levels: {any}\n", .{ topic, topic_levels.items });
+        try self.root.subscribe(topic_levels.items, client, allocator);
     }
 
     pub fn unsubscribe(self: *SubscriptionTree, topic: []const u8, client: *Client) !bool {
@@ -144,11 +178,55 @@ pub const SubscriptionTree = struct {
         return try self.root.unsubscribe(topic_levels, client, allocator);
     }
 
-    pub fn match(self: *SubscriptionTree, topic: []const u8, allocator: *Allocator) !ArrayList(*Client) {
+    /// 匹配订阅的客户端,支持去重和 no_local 过滤
+    /// publisher_client_id: 发布消息的客户端 ID (MQTT 客户端标识符)
+    pub fn match(self: *SubscriptionTree, topic: []const u8, publisher_client_id: ?[]const u8, allocator: *Allocator) !ArrayList(*Client) {
         var matched_clients: ArrayList(*Client) = .{};
-        const topic_levels = try parseTopicLevels(topic, self.root.children.allocator);
-        try self.root.match(topic_levels, &matched_clients, allocator.*);
-        return matched_clients;
+
+        // 解析主题层级(临时使用,不需要 dupe)
+        var topic_levels: ArrayList([]const u8) = .{};
+        defer topic_levels.deinit(self.root.children.allocator);
+
+        var iterator = std.mem.splitScalar(u8, topic, '/');
+        while (iterator.next()) |level| {
+            try topic_levels.append(self.root.children.allocator, level);
+        }
+
+        std.debug.print(">> match() >> topic: '{s}', topic_levels: {any}\n", .{ topic, topic_levels.items });
+
+        try self.root.match(topic_levels.items, &matched_clients, allocator.*);
+
+        std.debug.print(">> match() >> found {} potential clients before deduplication\n", .{matched_clients.items.len});
+
+        // 去重:使用 StringHashMap 追踪已添加的客户端 (按 MQTT 客户端 ID)
+        var seen = std.StringHashMap(void).init(allocator.*);
+        defer seen.deinit();
+
+        var deduplicated: ArrayList(*Client) = .{};
+        for (matched_clients.items) |client| {
+            // 跳过已断开连接的客户端
+            if (!client.is_connected) continue;
+
+            // 跳过自己发布的消息 (no_local 支持)
+            if (publisher_client_id) |pub_id| {
+                if (std.mem.eql(u8, client.identifer, pub_id) and client.hasNoLocal(topic)) {
+                    std.debug.print(">> Skipping publisher '{s}' due to no_local\n", .{client.identifer});
+                    continue;
+                }
+            }
+
+            // 去重检查
+            const result = try seen.getOrPut(client.identifer);
+            if (!result.found_existing) {
+                try deduplicated.append(allocator.*, client);
+                std.debug.print(">> Added subscriber: '{s}'\n", .{client.identifer});
+            } else {
+                std.debug.print(">> Skipped duplicate: '{s}'\n", .{client.identifer});
+            }
+        }
+
+        matched_clients.deinit(allocator.*);
+        return deduplicated;
     }
 
     fn parseTopicLevels(topic: []const u8, allocator: Allocator) ![][]const u8 {

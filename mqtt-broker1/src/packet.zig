@@ -319,8 +319,17 @@ pub const Writer = struct {
             return PacketWriterError.BufferTooSmall;
         }
         try self.writeTwoBytes(@intCast(string.len));
-        std.mem.copy(u8, self.buffer[self.pos..], string);
+        @memcpy(self.buffer[self.pos..][0..string.len], string);
         self.pos += string.len;
+    }
+
+    /// 批量写入字节数组 (性能优化,避免逐字节循环)
+    pub fn writeBytes(self: *Writer, bytes: []const u8) !void {
+        if (self.pos + bytes.len > self.buffer.len) {
+            return PacketWriterError.BufferTooSmall;
+        }
+        @memcpy(self.buffer[self.pos..][0..bytes.len], bytes);
+        self.pos += bytes.len;
     }
 
     fn encodeLengthBytes(length: usize) ![4]u8 {

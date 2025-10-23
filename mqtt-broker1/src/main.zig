@@ -7,6 +7,7 @@ const ConnectError = @import("handle_connect.zig").ConnectError;
 const SubscriptionTree = @import("subscription.zig").SubscriptionTree;
 const subscribe = @import("handle_subscribe.zig");
 const unsubscribe = @import("handle_unsubscribe.zig");
+const publish = @import("handle_publish.zig");
 const logger = @import("logger.zig");
 const assert = std.debug.assert;
 const net = std.net;
@@ -252,7 +253,65 @@ const MqttBroker = struct {
                 },
                 .PUBLISH => {
                     logger.debug("{s} sent PUBLISH", .{client_name});
-                    // TODO: 实现 PUBLISH 处理
+
+                    // 读取 PUBLISH 包
+                    const publish_packet = try publish.read(reader);
+
+                    logger.info("{s} published to '{s}' (payload: {d} bytes)", .{ client_name, publish_packet.topic, publish_packet.payload.len });
+
+                    // 根据 QoS 发送确认
+                    switch (publish_packet.qos) {
+                        .AtMostOnce => {}, // QoS 0 不需要确认
+                        .AtLeastOnce => {
+                            if (publish_packet.packet_id) |pid| {
+                                try publish.sendPuback(writer, client, pid);
+                            }
+                        },
+                        .ExactlyOnce => {
+                            if (publish_packet.packet_id) |pid| {
+                                try publish.sendPubrec(writer, client, pid);
+                            }
+                        },
+                    }
+
+                    // 查找匹配的订阅者 (传递发布者的 MQTT 客户端 ID 以支持 no_local)
+                    var matched_clients = try self.subscriptions.match(publish_packet.topic, client.identifer, &self.allocator);
+                    defer matched_clients.deinit(self.allocator);
+
+                    logger.info("   📨 Found {d} matching subscriber(s)", .{matched_clients.items.len});
+
+                    // 转发消息给所有匹配的订阅者
+                    for (matched_clients.items) |subscriber| {
+                        // 跳过发布者自己 (no_local 逻辑已在 match 中处理)
+                        // 这里只需要确保客户端仍然连接
+                        if (!subscriber.is_connected) {
+                            logger.warn("   ⚠️  Skipping disconnected subscriber: {s}", .{subscriber.identifer});
+                            continue;
+                        }
+
+                        // 构建转发的 PUBLISH 包
+                        writer.reset();
+                        try publish.writePublish(
+                            writer,
+                            publish_packet.topic,
+                            publish_packet.payload,
+                            .AtMostOnce, // 转发时默认使用 QoS 0 (简化实现)
+                            publish_packet.retain,
+                            false, // dup = false
+                            null, // QoS 0 不需要 packet_id
+                        );
+
+                        // 发送给订阅者
+                        writer.writeToStream(&subscriber.stream) catch |err| {
+                            logger.err("   ❌ Failed to send to {s}: {any}", .{ subscriber.identifer, err });
+                            continue;
+                        };
+
+                        logger.debug("   ✅ Forwarded to {s}", .{subscriber.identifer});
+                    }
+
+                    // 移动 reader 位置到末尾
+                    reader.pos = reader.length;
                 },
                 .UNSUBSCRIBE => {
                     logger.debug("{s} sent UNSUBSCRIBE", .{client_name});
@@ -284,7 +343,17 @@ const MqttBroker = struct {
                 },
                 .PUBREC => {
                     logger.debug("{s} sent PUBREC", .{client_name});
-                    // TODO: 实现 QoS 2 处理
+                    // 客户端发送 PUBREC 说明它收到了我们转发的 QoS 2 消息 (我们作为发布者)
+                    // 当前实现转发时使用 QoS 0,所以暂不处理
+                },
+                .PUBREL => {
+                    logger.debug("{s} sent PUBREL", .{client_name});
+                    // QoS 2 第二步:客户端确认收到 PUBREC,我们需要发送 PUBCOMP
+                    const packet_id = try reader.readTwoBytes();
+                    try publish.sendPubcomp(writer, client, packet_id);
+
+                    // 移动 reader 位置
+                    reader.pos = reader.length;
                 },
                 .PINGREQ => {
                     logger.debug("{s} sent PINGREQ (heartbeat, last_activity: {d})", .{ client_name, client.last_activity });

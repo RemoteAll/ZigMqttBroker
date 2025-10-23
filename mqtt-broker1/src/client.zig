@@ -79,6 +79,60 @@ pub const Client = struct {
         };
     };
 
+    /// 检查客户端对某个主题是否设置了 no_local 标志
+    /// 如果设置了 no_local,该客户端发布的消息不会被转发回来
+    pub fn hasNoLocal(self: *const Client, topic: []const u8) bool {
+        for (self.subscriptions.items) |sub| {
+            // 简单匹配:检查主题是否与订阅过滤器匹配
+            if (topicMatchesFilter(topic, sub.topic_filter) and sub.no_local) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// 简单的主题匹配函数
+    /// 支持 MQTT 通配符:
+    /// - '+' 匹配单级
+    /// - '#' 匹配多级(必须在末尾)
+    fn topicMatchesFilter(topic: []const u8, filter: []const u8) bool {
+        // 精确匹配
+        if (std.mem.eql(u8, topic, filter)) {
+            return true;
+        }
+
+        // 多级通配符 '#'
+        if (std.mem.endsWith(u8, filter, "/#")) {
+            const prefix = filter[0 .. filter.len - 2];
+            if (prefix.len == 0) return true; // "#" 匹配所有
+            if (std.mem.startsWith(u8, topic, prefix)) {
+                if (topic.len == prefix.len) return true; // 精确匹配前缀
+                if (topic.len > prefix.len and topic[prefix.len] == '/') return true;
+            }
+            return false;
+        }
+
+        // 单级通配符 '+'
+        if (std.mem.indexOf(u8, filter, "+") != null) {
+            var topic_it = std.mem.splitSequence(u8, topic, "/");
+            var filter_it = std.mem.splitSequence(u8, filter, "/");
+
+            while (true) {
+                const t_level = topic_it.next();
+                const f_level = filter_it.next();
+
+                if (t_level == null and f_level == null) return true; // 都结束
+                if (t_level == null or f_level == null) return false; // 长度不匹配
+
+                if (!std.mem.eql(u8, f_level.?, "+")) {
+                    if (!std.mem.eql(u8, t_level.?, f_level.?)) return false;
+                }
+            }
+        }
+
+        return false;
+    }
+
     pub const Message = struct {
         topic: []const u8,
         payload: []const u8,
