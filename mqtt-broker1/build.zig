@@ -24,15 +24,27 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // 异步版本 (使用 iobeetle IO)
+    const exe_async = b.addExecutable(.{
+        .name = "mqtt-broker-async",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main_async.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
     b.installArtifact(exe);
+    b.installArtifact(exe_async);
 
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish
     // such a dependency.
     const run_cmd = b.addRunArtifact(exe);
+    const run_async_cmd = b.addRunArtifact(exe_async);
 
     // By making the run step depend on the install step, it will be run from the
     // installation directory rather than directly from within the cache directory.
@@ -51,6 +63,11 @@ pub fn build(b: *std.Build) void {
     // This will evaluate the `run` step rather than the default, which is "install".
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
+
+    // 异步版本运行步骤
+    const run_async_step = b.step("run-async", "Run the async IO version");
+    run_async_step.dependOn(b.getInstallStep());
+    run_async_step.dependOn(&run_async_cmd.step);
 
     const exe_unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
