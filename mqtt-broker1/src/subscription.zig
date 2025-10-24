@@ -34,7 +34,7 @@ pub const SubscriptionTree = struct {
                 // 检查是否已订阅（避免重复增加引用计数）
                 for (self.subscribers.items) |existing_client| {
                     if (existing_client.id == client.id) {
-                        std.debug.print(">> Client {s} already subscribed, skipping\n", .{client.identifer});
+                        logger.debug("Client {s} already subscribed, skipping", .{client.identifer});
                         return; // 已订阅，不重复添加
                     }
                 }
@@ -46,11 +46,11 @@ pub const SubscriptionTree = struct {
             }
 
             const current_level = topic_levels[0];
-            std.debug.print(">> Node.subscribe() >> current_level: '{s}'\n", .{current_level});
+            logger.debug("Node.subscribe() >> current_level: '{s}'", .{current_level});
 
             // 先尝试获取已存在的节点
             if (self.children.getPtr(current_level)) |child| {
-                std.debug.print(">> Found existing node for '{s}'\n", .{current_level});
+                logger.debug("Found existing node for '{s}'", .{current_level});
                 try child.subscribe(topic_levels[1..], client, allocator);
             } else {
                 // 节点不存在,创建新节点并复制键
@@ -63,7 +63,7 @@ pub const SubscriptionTree = struct {
                 };
 
                 try self.children.put(key_copy, new_node);
-                std.debug.print(">> Created new node for '{s}'\n", .{key_copy});
+                logger.debug("Created new node for '{s}'", .{key_copy});
 
                 // 递归订阅下一层
                 const child_ptr = self.children.getPtr(key_copy).?;
@@ -83,7 +83,7 @@ pub const SubscriptionTree = struct {
                         // 释放引用计数
                         const should_cleanup = removed_client.release();
                         if (should_cleanup) {
-                            std.debug.print(">> Client {s} can be safely cleaned up (ref_count=0)\n", .{removed_client.identifer});
+                            logger.debug("Client {s} can be safely cleaned up (ref_count=0)", .{removed_client.identifer});
                             // 注意：这里不实际释放 Client 对象，因为它由 ClientConnection 的 Arena 管理
                             // 只是标记可以安全清理
                         }
@@ -143,11 +143,12 @@ pub const SubscriptionTree = struct {
         }
 
         pub fn match(self: *Node, topic_levels: [][]const u8, matched_clients: *ArrayList(*Client), allocator: Allocator) !void {
-            std.debug.print(">> Node.match() >> topic_levels.len={d}, subscribers.len={d}\n", .{ topic_levels.len, self.subscribers.items.len });
+            // 使用 logger.debug 替代 std.debug.print，可通过日志级别控制
+            logger.debug("Node.match() >> topic_levels.len={d}, subscribers.len={d}", .{ topic_levels.len, self.subscribers.items.len });
 
             // 如果没有更多层级，收集当前节点的订阅者
             if (topic_levels.len == 0) {
-                std.debug.print(">> Reached end of topic, adding {d} subscribers\n", .{self.subscribers.items.len});
+                logger.debug("Reached end of topic, adding {d} subscribers", .{self.subscribers.items.len});
                 for (self.subscribers.items) |client| {
                     try matched_clients.append(allocator, client);
                 }
@@ -155,11 +156,11 @@ pub const SubscriptionTree = struct {
             }
 
             const current_level = topic_levels[0];
-            std.debug.print(">> Matching level: '{s}'\n", .{current_level});
+            logger.debug("Matching level: '{s}'", .{current_level});
 
             // 1. 处理多级通配符 '#' (匹配所有剩余层级)
             if (self.children.getPtr("#")) |wildcard_child| {
-                std.debug.print(">> Found '#' wildcard, adding {d} subscribers\n", .{wildcard_child.subscribers.items.len});
+                logger.debug("Found '#' wildcard, adding {d} subscribers", .{wildcard_child.subscribers.items.len});
                 // '#' 匹配当前层级和所有子层级，直接收集订阅者
                 for (wildcard_child.subscribers.items) |client| {
                     try matched_clients.append(allocator, client);
@@ -168,16 +169,16 @@ pub const SubscriptionTree = struct {
 
             // 2. 处理单级通配符 '+' (只匹配当前层级)
             if (self.children.getPtr("+")) |plus_child| {
-                std.debug.print(">> Found '+' wildcard\n", .{});
+                logger.debug("Found '+' wildcard", .{});
                 try plus_child.match(topic_levels[1..], matched_clients, allocator);
             }
 
             // 3. 精确匹配当前层级
             if (self.children.getPtr(current_level)) |child| {
-                std.debug.print(">> Found exact match for '{s}'\n", .{current_level});
+                logger.debug("Found exact match for '{s}'", .{current_level});
                 try child.match(topic_levels[1..], matched_clients, allocator);
             } else {
-                std.debug.print(">> No match found for '{s}'\n", .{current_level});
+                logger.debug("No match found for '{s}'", .{current_level});
             }
         }
 
@@ -279,7 +280,7 @@ pub const SubscriptionTree = struct {
     /// 增加缓存版本号(订阅变更时调用)
     fn bumpCacheVersion(self: *SubscriptionTree) void {
         _ = self.cache_version.fetchAdd(1, .monotonic);
-        std.debug.print(">> Cache version bumped to {d}\n", .{self.cache_version.load(.monotonic)});
+        logger.debug("Cache version bumped to {d}", .{self.cache_version.load(.monotonic)});
     }
 
     /// 清除过期缓存项(按需清理,避免全量清理)
@@ -306,7 +307,7 @@ pub const SubscriptionTree = struct {
         }
 
         if (to_remove.items.len > 0) {
-            std.debug.print(">> Cleaned {d} stale cache entries\n", .{to_remove.items.len});
+            logger.debug("Cleaned {d} stale cache entries", .{to_remove.items.len});
         }
     }
 
@@ -325,7 +326,7 @@ pub const SubscriptionTree = struct {
             try topic_levels.append(allocator, level);
         }
 
-        std.debug.print(">> subscribe() >> topic: '{s}', topic_levels: {any}\n", .{ topic, topic_levels.items });
+        logger.debug("subscribe() >> topic: '{s}', topic_levels: {any}", .{ topic, topic_levels.items });
         try self.root.subscribe(topic_levels.items, client, allocator);
 
         // 订阅关系改变,增加版本号(缓存延迟失效)
@@ -355,7 +356,7 @@ pub const SubscriptionTree = struct {
         const topic_levels = try parseTopicLevels(topic, allocator);
         defer allocator.free(topic_levels); // 释放 parseTopicLevels 分配的内存
 
-        std.debug.print(">> unsubscribe() >> topic_levels: {any}\n", .{topic_levels});
+        logger.debug("unsubscribe() >> topic_levels: {any}", .{topic_levels});
         const result = try self.root.unsubscribe(topic_levels, client, allocator);
 
         // 取消订阅成功,增加版本号(缓存延迟失效)
@@ -509,11 +510,11 @@ pub const SubscriptionTree = struct {
             try topic_levels.append(self.root.children.allocator, level);
         }
 
-        std.debug.print(">> match() >> topic: '{s}', topic_levels: {any}\n", .{ topic, topic_levels.items });
+        logger.debug("match() >> topic: '{s}', topic_levels: {any}", .{ topic, topic_levels.items });
 
         try self.root.match(topic_levels.items, &matched_clients, allocator.*);
 
-        std.debug.print(">> match() >> found {} potential clients before deduplication\n", .{matched_clients.items.len});
+        logger.debug("match() >> found {} potential clients before deduplication", .{matched_clients.items.len});
 
         // 去重:使用 StringHashMap 追踪已添加的客户端 (按 MQTT 客户端 ID)
         var seen = std.StringHashMap(void).init(allocator.*);
@@ -527,7 +528,7 @@ pub const SubscriptionTree = struct {
             // 跳过自己发布的消息 (no_local 支持)
             if (publisher_client_id) |pub_id| {
                 if (std.mem.eql(u8, client.identifer, pub_id) and client.hasNoLocal(topic)) {
-                    std.debug.print(">> Skipping publisher '{s}' due to no_local\n", .{client.identifer});
+                    logger.debug("Skipping publisher '{s}' due to no_local", .{client.identifer});
                     continue;
                 }
             }
@@ -536,9 +537,9 @@ pub const SubscriptionTree = struct {
             const result = try seen.getOrPut(client.identifer);
             if (!result.found_existing) {
                 try deduplicated.append(allocator.*, client);
-                std.debug.print(">> Added subscriber: '{s}'\n", .{client.identifer});
+                logger.debug("Added subscriber: '{s}'", .{client.identifer});
             } else {
-                std.debug.print(">> Skipped duplicate: '{s}'\n", .{client.identifer});
+                logger.debug("Skipped duplicate: '{s}'", .{client.identifer});
             }
         }
 
@@ -564,7 +565,7 @@ pub const SubscriptionTree = struct {
             };
 
             try self.match_cache.put(topic_copy, cache_entry);
-            std.debug.print(">> Cached result for topic: '{s}' ({d} clients, version: {d})\n", .{ topic, deduplicated.items.len, current_version });
+            logger.debug("Cached result for topic: '{s}' ({d} clients, version: {d})", .{ topic, deduplicated.items.len, current_version });
         }
 
         return deduplicated;
@@ -586,7 +587,7 @@ pub const SubscriptionTree = struct {
     fn parseTopicLevels(topic: []const u8, allocator: Allocator) ![][]const u8 {
         // 防止空字符串导致段错误
         if (topic.len == 0) {
-            std.debug.print("WARNING: parseTopicLevels received empty topic\n", .{});
+            logger.warn("parseTopicLevels received empty topic", .{});
             return &[_][]const u8{};
         }
 
@@ -633,12 +634,12 @@ pub const SubscriptionTree = struct {
             if (c == '#') {
                 // [MQTT-4.7.1-2] '#' 必须是最后一个字符
                 if (i != topic.len - 1) {
-                    std.debug.print("ERROR: Multi-level wildcard '#' must be the last character\n", .{});
+                    logger.err("Multi-level wildcard '#' must be the last character", .{});
                     return error.InvalidTopicFilter;
                 }
                 // '#' 必须是单独的层级或在 '/' 之后
                 if (i > 0 and topic[i - 1] != '/') {
-                    std.debug.print("ERROR: Multi-level wildcard '#' must occupy an entire level\n", .{});
+                    logger.err("Multi-level wildcard '#' must occupy an entire level", .{});
                     return error.InvalidTopicFilter;
                 }
             }
@@ -648,12 +649,12 @@ pub const SubscriptionTree = struct {
                 // [MQTT-4.7.1-3] '+' 必须占据整个层级
                 // 检查前面的字符
                 if (i > 0 and topic[i - 1] != '/') {
-                    std.debug.print("ERROR: Single-level wildcard '+' must occupy an entire level\n", .{});
+                    logger.err("Single-level wildcard '+' must occupy an entire level", .{});
                     return error.InvalidTopicFilter;
                 }
                 // 检查后面的字符
                 if (i + 1 < topic.len and topic[i + 1] != '/') {
-                    std.debug.print("ERROR: Single-level wildcard '+' must occupy an entire level\n", .{});
+                    logger.err("Single-level wildcard '+' must occupy an entire level", .{});
                     return error.InvalidTopicFilter;
                 }
             }

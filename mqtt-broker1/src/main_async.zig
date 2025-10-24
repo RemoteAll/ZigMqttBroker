@@ -1237,6 +1237,14 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // 设置日志级别（根据配置）
+    logger.setLevel(switch (config.DEFAULT_LOG_LEVEL) {
+        .debug => .debug,
+        .info => .info,
+        .warn => .warn,
+        .err => .err,
+    });
+
     const broker = try MqttBroker.init(allocator);
     defer broker.deinit();
 
