@@ -1,14 +1,5 @@
 {
   "subscriptions": {
-    "mqttx_53405449": [
-      {
-        "topic_filter": "testtopic/#",
-        "qos": 0,
-        "no_local": false,
-        "retain_as_published": false,
-        "retain_handling": 0
-      }
-    ],
     "mqttx_a67c1ac5": [
       {
         "topic_filter": "testtopic/#",

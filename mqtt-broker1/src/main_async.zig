@@ -1176,10 +1176,16 @@ pub const MqttBroker = struct {
         // 启动统计定时器
         self.startStatsRoutine();
 
-        // 进入事件循环
+        // 进入事件循环（阻塞模式，避免CPU忙等待）
+        // 使用 run_for_ns 而非 run，确保在没有事件时阻塞等待而非轮询
         logger.info("Entering event loop...", .{});
         while (true) {
-            self.io.run() catch |err| {
+            // 阻塞等待最多30秒（或直到有事件/超时发生）
+            // iobeetle 会根据已注册的定时器（如心跳、统计）自动计算实际等待时间
+            // 实际等待时间 = min(30秒, 下一个定时器到期时间)
+            // 这样可以避免无谓的频繁唤醒，同时保证定时器准时触发
+            // 注意：任何网络事件（连接、数据到达等）都会立即中断等待
+            self.io.run_for_ns(30 * std.time.ns_per_s) catch |err| {
                 // IO 错误通常是由于已关闭的 socket 触发的，这是正常的断开流程
                 // 只记录非预期的严重错误，其他错误忽略以保持服务器运行
                 switch (err) {
