@@ -103,28 +103,36 @@ const ClientConnection = struct {
     }
 
     pub fn deinit(self: *ClientConnection, base_allocator: Allocator) void {
-        // 检查 Client 对象的引用计数
+        // ⚠️ 注意：此时 self.client 可能处于任何状态（ref_count 可能为 0 或 >0）
+        // 不要过度依赖 self.client 的内容，因为它是 Arena 分配的
+
+        // 尝试安全地获取引用计数（如果失败就跳过日志）
         const ref_count = self.client.getRefCount();
+
         if (ref_count > 0) {
             // 警告：仍有其他引用（订阅树等）持有该 Client 指针
             // 但由于使用 Arena 分配，Arena.deinit() 会释放所有内存
             // 这会导致订阅树中的指针变成悬垂指针
-            logger.warn(
-                "Client {s} (#{}) still has {} reference(s) when deinit, potential dangling pointers!",
-                .{ self.client.identifer, self.client.id, ref_count },
-            );
 
-            // 解决方案：确保在 deinit 前调用 unsubscribeAll
-            // 或者实现延迟清理机制
+            // ⚠️ 注意：identifer 可能已经无效，尝试读取可能导致崩溃
+            // 只记录 ID 和引用计数，不访问字符串字段
+            logger.warn(
+                "Client #{} still has {} reference(s) when deinit, potential dangling pointers!",
+                .{ self.client.id, ref_count },
+            );
         } else {
-            logger.debug("Client {s} (#{}) can be safely freed (ref_count=0)", .{ self.client.identifer, self.client.id });
+            logger.debug("Client #{} can be safely freed (ref_count=0)", .{self.client.id});
         }
+
+        // ⚠️ 关键：先保存 arena 指针，因为 self 本身也在 arena 中！
+        // arena.deinit() 会释放 self，之后不能再访问 self.arena
+        const arena = self.arena;
 
         // 注意：Client 对象由 Arena 分配，不需要手动调用 Client.deinit()
         // 只需要确保 stream 已关闭（应该在 disconnect 中已经关闭）
-        // Arena.deinit() 会自动释放所有分配的内存（包括 Client 对象和所有字段）
-        self.arena.deinit();
-        base_allocator.destroy(self.arena);
+        // Arena.deinit() 会自动释放所有分配的内存（包括 self 和 Client 对象）
+        arena.deinit();
+        base_allocator.destroy(arena);
     }
 
     /// 开始异步读取数据
@@ -181,17 +189,25 @@ const ClientConnection = struct {
                     self.broker.metrics.incNetworkError();
                 },
             }
-            self.disconnect() catch |disconnect_err| {
+            const need_cleanup = self.disconnect() catch |disconnect_err| {
                 std.log.err("Failed to disconnect client after recv error: {any}", .{disconnect_err});
+                return;
             };
+            if (need_cleanup) {
+                self.deinit(self.broker.allocator);
+            }
             return;
         };
 
         if (length == 0) {
             logger.info("Client {d} disconnected (EOF)", .{self.id});
-            self.disconnect() catch |disconnect_err| {
+            const need_cleanup = self.disconnect() catch |disconnect_err| {
                 std.log.err("Failed to disconnect client after EOF: {any}", .{disconnect_err});
+                return;
             };
+            if (need_cleanup) {
+                self.deinit(self.broker.allocator);
+            }
             return;
         }
 
@@ -207,28 +223,42 @@ const ClientConnection = struct {
         self.reader.start(length) catch |err| {
             logger.err("Client {d} reader.start error: {any}", .{ self.id, err });
             self.broker.metrics.incProtocolError();
-            self.disconnect() catch |disconnect_err| {
+            const need_cleanup = self.disconnect() catch |disconnect_err| {
                 std.log.err("Failed to disconnect client after reader error: {any}", .{disconnect_err});
+                return;
             };
+            if (need_cleanup) {
+                self.deinit(self.broker.allocator);
+            }
             return;
         };
 
         // 解析并处理 MQTT 包
-        self.processPackets() catch |err| {
+        const self_destroyed = self.processPackets() catch |err| {
             logger.err("Client {d} process error: {any}", .{ self.id, err });
             self.broker.metrics.incProtocolError();
-            self.disconnect() catch |disconnect_err| {
+            const need_cleanup = self.disconnect() catch |disconnect_err| {
                 std.log.err("Failed to disconnect client after process error: {any}", .{disconnect_err});
+                return;
             };
+            if (need_cleanup) {
+                self.deinit(self.broker.allocator);
+            }
             return;
         };
+
+        // 如果 self 已被清理（处理了 DISCONNECT），不要再访问 self
+        if (self_destroyed) {
+            return;
+        }
 
         // 继续读取下一批数据
         self.startRead(self.broker.io);
     }
 
     /// 处理接收到的 MQTT 包
-    fn processPackets(self: *ClientConnection) !void {
+    /// 返回值：true = self 已被清理（不要再访问），false = self 仍然有效
+    fn processPackets(self: *ClientConnection) !bool {
         self.state = .Processing;
 
         while (self.reader.pos < self.reader.length) {
@@ -241,10 +271,14 @@ const ClientConnection = struct {
 
             if (cmd == .DISCONNECT) {
                 logger.info("Client {d} sent DISCONNECT", .{self.id});
-                self.disconnect() catch |disconnect_err| {
+                const need_cleanup = self.disconnect() catch |disconnect_err| {
                     std.log.err("Failed to disconnect client after DISCONNECT packet: {any}", .{disconnect_err});
+                    return false; // 断开失败，self 仍然有效
                 };
-                return;
+                if (need_cleanup) {
+                    self.deinit(self.broker.allocator);
+                }
+                return true; // self 已被清理
             }
 
             const remaining_length = try self.reader.readRemainingLength();
@@ -262,7 +296,19 @@ const ClientConnection = struct {
             logger.debug("Client {d} packet type={any} payload={d} bytes", .{ self.id, cmd, remaining_length });
 
             switch (cmd) {
-                .CONNECT => try self.handleConnect(),
+                .CONNECT => {
+                    self.handleConnect() catch |err| {
+                        if (err == error.ConnectionRejected) {
+                            // 连接被拒绝，需要断开并清理
+                            const need_cleanup = self.disconnect() catch true;
+                            if (need_cleanup) {
+                                self.deinit(self.broker.allocator);
+                            }
+                            return true; // self 已被清理
+                        }
+                        return err; // 其他错误传播
+                    };
+                },
                 .SUBSCRIBE => try self.handleSubscribe(),
                 .PUBLISH => try self.handlePublish(),
                 .UNSUBSCRIBE => try self.handleUnsubscribe(),
@@ -280,6 +326,9 @@ const ClientConnection = struct {
             // 这样可以避免包边界混乱的问题
             self.reader.pos = packet_end_pos;
         }
+
+        // 正常处理完所有包，self 仍然有效
+        return false;
     }
 
     fn handleConnect(self: *ClientConnection) !void {
@@ -319,10 +368,9 @@ const ClientConnection = struct {
             try connect.connack(self.writer, &self.client.stream, reason_code, false);
             self.broker.metrics.incMessageSent(4); // CONNACK 固定4字节(包含字节统计)
             logger.warn("Client {d} connection rejected: {any}", .{ self.id, reason_code });
-            self.disconnect() catch |disconnect_err| {
-                std.log.err("Failed to disconnect client after CONNACK rejection: {any}", .{disconnect_err});
-            };
-            return;
+
+            // 抛出错误让调用者处理断开（不在这里 deinit）
+            return error.ConnectionRejected;
         }
 
         // 连接成功
@@ -671,10 +719,11 @@ const ClientConnection = struct {
     }
 
     /// 断开连接
-    fn disconnect(self: *ClientConnection) !void {
+    /// 返回值：true = 需要调用 deinit() 清理，false = 不需要（已转移到 orphan_clients 或重复调用）
+    fn disconnect(self: *ClientConnection) !bool {
         // 防止重复断开连接
         if (self.is_disconnecting) {
-            return;
+            return false; // 重复调用，不需要清理
         }
         self.is_disconnecting = true;
 
@@ -732,8 +781,8 @@ const ClientConnection = struct {
             // 注意：这里需要创建一个新的 Client 副本，因为原 Client 由 Arena 管理
             const orphan_client = self.broker.allocator.create(Client) catch |err| {
                 logger.err("Failed to create orphan client: {any}", .{err});
-                // 无法转移，只能泄漏
-                return;
+                // 无法转移，只能泄漏 - 返回 true 让调用者清理 ClientConnection
+                return true;
             };
 
             // ⚠️ 复制基本字段（标量类型）
@@ -814,24 +863,25 @@ const ClientConnection = struct {
                 logger.err("Failed to add orphan client to broker: {any}", .{err});
                 self.broker.allocator.free(identifer_copy);
                 self.broker.allocator.destroy(orphan_client);
-                return;
+                return false; // 失败也不需要清理（泄漏了）
             };
 
             logger.info("Client {s} successfully transferred to orphan_clients", .{self.client.identifer});
 
             // 现在可以安全释放 ClientConnection 和它的 Arena
             // orphan_client 已经独立管理
-            self.deinit(self.broker.allocator);
+            // ✅ 返回 true 表示调用者需要调用 deinit()
+            return true;
         } else {
             // ref_count <= 1: 只有 ClientConnection 持有引用，可以安全释放
             logger.debug("Client {s} (#{}) can be safely freed (ref_count={})", .{ self.client.identifer, self.client.id, ref_count });
 
             // 释放 ClientConnection 自己持有的引用
-            // 这样 deinit() 中检查 ref_count 时就是 0 了
+            // 这样后续 deinit() 中检查 ref_count 时就是 0 了
             _ = self.client.release();
 
-            // 清理资源
-            self.deinit(self.broker.allocator);
+            // ✅ 返回 true 表示调用者需要调用 deinit()
+            return true;
         }
     }
 };
