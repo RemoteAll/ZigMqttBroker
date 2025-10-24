@@ -331,6 +331,19 @@ const ClientConnection = struct {
         self.client.protocol_version = mqtt.ProtocolVersion.fromU8(connect_packet.protocol_version);
         self.client.keep_alive = connect_packet.keep_alive;
         self.client.clean_start = connect_packet.connect_flags.clean_session;
+
+        // 设置会话过期时间
+        // MQTT 3.1.1: 使用服务器配置的默认值（协议本身不支持此字段）
+        // MQTT 5.0: 应该从 CONNECT 包的属性中读取（待实现）
+        if (self.client.clean_start) {
+            // Clean Session = 1: 会话立即过期
+            self.client.session_expiry_interval = 0;
+        } else {
+            // Clean Session = 0: 使用默认过期时间
+            // TODO: MQTT 5.0 应该从 connect_packet 的 Session Expiry Interval 属性读取
+            self.client.session_expiry_interval = config.DEFAULT_SESSION_EXPIRY_SEC;
+        }
+
         self.client.is_connected = true;
         self.client.connect_time = time.milliTimestamp();
         self.client.last_activity = self.client.connect_time;
