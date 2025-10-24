@@ -983,10 +983,16 @@ pub const MqttBroker = struct {
         const io = try allocator.create(IO);
         io.* = try IO.init(config.IO_ENTRIES, 0);
 
-        // 创建并预热客户端连接池
+        // 创建客户端连接池（支持动态扩展）
         var client_pool = ClientConnectionPool.init(allocator);
-        try client_pool.preheat(config.MAX_CLIENTS_POOL);
-        logger.info("Client pool preheated with {d} connections", .{config.MAX_CLIENTS_POOL});
+
+        // 只预热初始大小的连接池（通常 1K-5K）
+        // 这样前期内存占用很小，不会浪费
+        try client_pool.preheat(config.INITIAL_POOL_SIZE);
+        logger.info(
+            "Client pool initialized: initial_size={d}, max_size={d}",
+            .{ config.INITIAL_POOL_SIZE, config.MAX_POOL_SIZE },
+        );
 
         // 初始化订阅持久化管理器
         const persistence = try allocator.create(SubscriptionPersistence);
@@ -1282,6 +1288,10 @@ pub const MqttBroker = struct {
         logger.info("Accepted new connection (socket={any})", .{client_socket});
         self.metrics.incConnectionAccepted();
 
+        // 自动扩展连接池（如果需要）
+        // 当实际连接接近预热大小时，提前扩展以避免分配延迟
+        self.autoExpandPoolIfNeeded();
+
         // 创建客户端连接（序号仅用于日志）
         const client_id = self.getNextClientId();
         const conn = ClientConnection.init(self.allocator, client_id, client_socket, self) catch |err| {
@@ -1305,6 +1315,38 @@ pub const MqttBroker = struct {
         const id = self.next_client_id;
         self.next_client_id += 1;
         return id;
+    }
+
+    /// 自动扩展连接池
+    /// 当活跃连接接近预热大小时，提前扩展以避免新连接分配延迟
+    fn autoExpandPoolIfNeeded(self: *MqttBroker) void {
+        const current_connections = self.clients.count();
+        const expansion_threshold = (config.INITIAL_POOL_SIZE * 80) / 100; // 预热大小的 80%
+
+        // 检查是否需要扩展
+        if (current_connections >= expansion_threshold) {
+            // 计算新的预热大小：当前大小的 1.5 倍，但不超过 MAX_POOL_SIZE
+            const next_size = @min(
+                (config.INITIAL_POOL_SIZE * 3) / 2,
+                config.MAX_POOL_SIZE,
+            );
+
+            // 只在还有扩展空间且池大小有增长时才扩展
+            if (next_size > config.INITIAL_POOL_SIZE) {
+                const expand_count = next_size - config.INITIAL_POOL_SIZE;
+                self.client_pool.preheat(expand_count) catch |err| {
+                    logger.warn(
+                        "Failed to auto-expand pool: {any} (current: {d}, target: {d})",
+                        .{ err, config.INITIAL_POOL_SIZE, next_size },
+                    );
+                    return;
+                };
+                logger.info(
+                    "Auto-expanded pool: +{d} connections (total preheated: {d})",
+                    .{ expand_count, next_size },
+                );
+            }
+        }
     }
 };
 
