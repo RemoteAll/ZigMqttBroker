@@ -288,13 +288,13 @@ pub const SubscriptionTree = struct {
         defer self.cache_rwlock.unlock();
 
         const current_version = self.cache_version.load(.monotonic);
-        var to_remove = ArrayList([]const u8).init(self.match_cache.allocator);
-        defer to_remove.deinit();
+        var to_remove: ArrayList([]const u8) = .{};
+        defer to_remove.deinit(self.match_cache.allocator);
 
         var it = self.match_cache.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.version < current_version) {
-                to_remove.append(entry.key_ptr.*) catch continue;
+                to_remove.append(self.match_cache.allocator, entry.key_ptr.*) catch continue;
             }
         }
 
@@ -449,8 +449,10 @@ pub const SubscriptionTree = struct {
             logger.warn("No client pointers found to replace for client {s}", .{old_client.identifer});
         }
 
-        // 清除缓存，因为 Client 指针已变化
+        // ⚠️ 关键：立即清理缓存，避免缓存中的悬垂指针
+        // 仅 bump 版本号是不够的，必须立即清理包含旧指针的缓存项
         self.bumpCacheVersion();
+        self.cleanStaleCache();
     }
 
     /// 匹配订阅的客户端,支持去重、no_local 过滤和高性能缓存

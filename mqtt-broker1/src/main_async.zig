@@ -765,7 +765,11 @@ const ClientConnection = struct {
             self.deinit(self.broker.allocator);
         } else {
             // ref_count <= 1: 只有 ClientConnection 持有引用，可以安全释放
-            logger.debug("Client {s} (#{}) can be safely freed (ref_count=1)", .{ self.client.identifer, self.client.id });
+            logger.debug("Client {s} (#{}) can be safely freed (ref_count={})", .{ self.client.identifer, self.client.id, ref_count });
+
+            // 释放 ClientConnection 自己持有的引用
+            // 这样 deinit() 中检查 ref_count 时就是 0 了
+            _ = self.client.release();
 
             // 清理资源
             self.deinit(self.broker.allocator);
