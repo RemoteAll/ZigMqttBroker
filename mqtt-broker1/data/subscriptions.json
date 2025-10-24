@@ -25,6 +25,13 @@
         "no_local": false,
         "retain_as_published": false,
         "retain_handling": 0
+      },
+      {
+        "topic_filter": "/test",
+        "qos": 0,
+        "no_local": false,
+        "retain_as_published": false,
+        "retain_handling": 0
       }
     ]
   }

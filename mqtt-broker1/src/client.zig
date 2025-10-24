@@ -26,6 +26,7 @@ pub const Client = struct {
     is_connected: bool,
     connect_time: i64,
     last_activity: i64,
+    disconnect_time: i64, // Clean Session = 0 断开时记录，用于会话过期判断
 
     // 引用计数：用于管理 Client 对象的生命周期
     // 当订阅树、消息队列等持有 *Client 指针时会增加引用计数
@@ -166,6 +167,7 @@ pub const Client = struct {
             .is_connected = false,
             .connect_time = 0,
             .last_activity = 0,
+            .disconnect_time = 0, // 初始化为 0，表示未断开
             .ref_count = std.atomic.Value(u32).init(1), // 初始引用计数为 1
             .clean_start = true,
             .session_expiry_interval = 0,

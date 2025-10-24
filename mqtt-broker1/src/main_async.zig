@@ -672,6 +672,9 @@ const ClientConnection = struct {
         // 标记客户端为已断开(但不立即释放)
         self.client.is_connected = false;
 
+        // 记录断开时间（用于会话过期判断）
+        self.client.disconnect_time = std.time.milliTimestamp();
+
         // 根据 Clean Session 标志决定是否清理订阅
         // [MQTT-3.1.2-6] Clean Session = 1: 断开时必须删除会话状态
         // [MQTT-3.1.2-5] Clean Session = 0: 断开时保留会话状态
@@ -869,6 +872,77 @@ pub const MqttBroker = struct {
         logger.info("MQTT broker shutdown complete", .{});
     }
 
+    /// 检查并清理过期的 orphan_clients
+    /// 根据 MQTT 规范，Clean Session = 0 的会话应该在 session_expiry_interval 后过期
+    pub fn cleanupExpiredSessions(self: *MqttBroker) void {
+        const now = std.time.milliTimestamp();
+        var to_remove: std.ArrayList([]const u8) = .{};
+        defer to_remove.deinit(self.allocator);
+
+        // 遍历所有 orphan_clients，检查是否过期
+        var it = self.orphan_clients.iterator();
+        while (it.next()) |entry| {
+            const client_id = entry.key_ptr.*;
+            const client = entry.value_ptr.*;
+
+            // 计算断开时长（毫秒）
+            const disconnected_ms = now - client.disconnect_time;
+            const session_expiry_ms: i64 = @as(i64, client.session_expiry_interval) * 1000;
+
+            // 检查是否过期
+            // session_expiry_interval = 0 表示会话在断开时立即过期
+            // session_expiry_interval = 0xFFFFFFFF 表示会话永不过期
+            const is_expired = if (client.session_expiry_interval == 0)
+                true // 立即过期
+            else if (client.session_expiry_interval == 0xFFFFFFFF)
+                false // 永不过期
+            else
+                disconnected_ms >= session_expiry_ms;
+
+            if (is_expired) {
+                logger.info(
+                    "Session expired for orphan client {s} (disconnected for {}ms, expiry={}s)",
+                    .{ client_id, disconnected_ms, client.session_expiry_interval },
+                );
+                to_remove.append(self.allocator, client_id) catch continue;
+            }
+        }
+
+        // 清理过期的 orphan_clients
+        for (to_remove.items) |client_id| {
+            if (self.orphan_clients.fetchRemove(client_id)) |kv| {
+                const client = kv.value;
+                const ref_count = client.getRefCount();
+
+                logger.info(
+                    "Removing expired orphan client {s} (ref_count={})",
+                    .{ client_id, ref_count },
+                );
+
+                // 强制清理订阅以释放引用
+                self.subscriptions.unsubscribeAll(client);
+
+                // 从持久化存储中删除
+                if (self.persistence.removeAllSubscriptions(client_id)) {
+                    logger.debug("Removed persisted subscriptions for expired client {s}", .{client_id});
+                } else |err| {
+                    logger.warn("Failed to remove persisted subscriptions for {s}: {any}", .{ client_id, err });
+                }
+
+                // 释放 client_id 字符串内存
+                self.allocator.free(client_id);
+
+                // 释放 Client 对象
+                client.deinit();
+                self.allocator.destroy(client);
+            }
+        }
+
+        if (to_remove.items.len > 0) {
+            logger.info("Cleaned up {} expired session(s)", .{to_remove.items.len});
+        }
+    }
+
     /// 启动异步 MQTT Broker
     pub fn start(self: *MqttBroker, port: u16) !void {
         logger.info("Starting async MQTT broker on port {d}", .{port});
@@ -960,6 +1034,9 @@ pub const MqttBroker = struct {
 
         // 输出统计信息
         self.metrics.logStats();
+
+        // 检查并清理过期的会话
+        self.cleanupExpiredSessions();
 
         // 重新启动定时器
         self.startStatsRoutine();
