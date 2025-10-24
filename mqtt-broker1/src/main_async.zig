@@ -120,7 +120,9 @@ const ClientConnection = struct {
             logger.debug("Client {s} (#{}) can be safely freed (ref_count=0)", .{ self.client.identifer, self.client.id });
         }
 
-        // Arena会自动释放所有分配的内存（包括 Client 对象）
+        // 注意：Client 对象由 Arena 分配，不需要手动调用 Client.deinit()
+        // 只需要确保 stream 已关闭（应该在 disconnect 中已经关闭）
+        // Arena.deinit() 会自动释放所有分配的内存（包括 Client 对象和所有字段）
         self.arena.deinit();
         base_allocator.destroy(self.arena);
     }
@@ -734,8 +736,63 @@ const ClientConnection = struct {
                 return;
             };
 
-            // 复制 Client 数据（浅拷贝，共享字符串指针）
-            orphan_client.* = self.client.*;
+            // ⚠️ 复制基本字段（标量类型）
+            orphan_client.id = self.client.id;
+            orphan_client.protocol_version = self.client.protocol_version;
+            // ⚠️ stream 已经关闭，设置为无效 handle 防止误用
+            orphan_client.stream = net.Stream{ .handle = IO.INVALID_SOCKET };
+            orphan_client.address = self.client.address; // 地址可以安全复制
+            orphan_client.is_connected = false; // ✅ 强制设为 false（已断开）
+            orphan_client.connect_time = self.client.connect_time;
+            orphan_client.last_activity = self.client.last_activity;
+            orphan_client.disconnect_time = self.client.disconnect_time;
+            orphan_client.clean_start = self.client.clean_start;
+            orphan_client.session_expiry_interval = self.client.session_expiry_interval;
+            orphan_client.keep_alive = self.client.keep_alive;
+            orphan_client.will_qos = self.client.will_qos;
+            orphan_client.will_retain = self.client.will_retain;
+            orphan_client.will_delay_interval = self.client.will_delay_interval;
+            orphan_client.receive_maximum = self.client.receive_maximum;
+            orphan_client.maximum_packet_size = self.client.maximum_packet_size;
+            orphan_client.topic_alias_maximum = self.client.topic_alias_maximum;
+            orphan_client.packet_id_counter = self.client.packet_id_counter;
+
+            // ⚠️ 深拷贝 identifer（关键：避免悬垂指针）
+            const identifer_copy = try self.broker.allocator.dupe(u8, self.client.identifer);
+            orphan_client.identifer = identifer_copy;
+
+            // ⚠️ 设置正确的 allocator（全局 allocator，不是 Arena）
+            orphan_client.allocator = self.broker.allocator;
+
+            // ⚠️ 深拷贝可选字符串字段
+            orphan_client.username = if (self.client.username) |u|
+                self.broker.allocator.dupe(u8, u) catch null
+            else
+                null;
+            orphan_client.password = if (self.client.password) |p|
+                self.broker.allocator.dupe(u8, p) catch null
+            else
+                null;
+            orphan_client.will_topic = if (self.client.will_topic) |t|
+                self.broker.allocator.dupe(u8, t) catch null
+            else
+                null;
+            orphan_client.will_payload = if (self.client.will_payload) |p|
+                self.broker.allocator.dupe(u8, p) catch null
+            else
+                null;
+
+            // ✅ 关键修复：重新初始化所有容器（使用空字面量）
+            // 不能浅拷贝，因为原容器内部指针指向 Arena 内存
+            // Zig 0.15.2: ArrayList 不再存储 allocator，deinit 时需要传入
+            orphan_client.subscriptions = .{};
+            orphan_client.incoming_queue = .{};
+            orphan_client.outgoing_queue = .{};
+            orphan_client.user_properties = std.StringHashMap([]const u8).init(self.broker.allocator);
+            orphan_client.inflight_messages = std.AutoHashMap(u16, Client.Message).init(self.broker.allocator);
+
+            // TODO: 如果需要保留订阅内容，需要深拷贝 subscriptions 列表
+            // 当前为了简化，订阅信息保留在订阅树中，这里容器为空
 
             // 重新初始化引用计数（继承当前的订阅引用）
             orphan_client.ref_count = std.atomic.Value(u32).init(@intCast(ref_count - 1));
@@ -749,11 +806,13 @@ const ClientConnection = struct {
             };
 
             // 将 orphan_client 加入 broker 管理
+            // 注意：使用相同的 identifer_copy 作为 HashMap 的 key
             self.broker.orphan_clients.put(
-                try self.broker.allocator.dupe(u8, self.client.identifer),
+                identifer_copy,
                 orphan_client,
             ) catch |err| {
                 logger.err("Failed to add orphan client to broker: {any}", .{err});
+                self.broker.allocator.free(identifer_copy);
                 self.broker.allocator.destroy(orphan_client);
                 return;
             };
@@ -856,6 +915,7 @@ pub const MqttBroker = struct {
         // 清理孤儿 Client 对象
         var orphan_it = self.orphan_clients.iterator();
         while (orphan_it.next()) |entry| {
+            const client_id = entry.key_ptr.*;
             const client = entry.value_ptr.*;
             const ref_count = client.getRefCount();
             logger.info("Cleaning up orphan client {s} (ref_count={})", .{ client.identifer, ref_count });
@@ -865,6 +925,11 @@ pub const MqttBroker = struct {
 
             // 现在应该可以安全释放了
             client.deinit();
+
+            // 释放 HashMap 持有的 key 与 Client 实例
+            // 注意：StringHashMap 不会替我们释放 key 内存
+            self.allocator.free(client_id);
+            self.allocator.destroy(client);
         }
         self.orphan_clients.deinit();
 

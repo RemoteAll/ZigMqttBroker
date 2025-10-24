@@ -179,6 +179,7 @@ pub const Client = struct {
             .will_qos = .AtMostOnce,
             .will_retain = false,
             .will_delay_interval = 0,
+            // ✅ Zig 0.15.2: 使用空字面量初始化 ArrayList
             .subscriptions = .{},
             .incoming_queue = .{},
             .outgoing_queue = .{},
@@ -220,19 +221,30 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
-        self.stream.close();
+        // 注意：orphan_client 的 stream 可能已经关闭或无效
+        // 所以不要调用 stream.close()，应该在 disconnect 时已经关闭
+        // self.stream.close();  // ❌ 不安全，stream 可能已经无效
+
         if (self.username) |username| self.allocator.free(username);
         if (self.password) |password| self.allocator.free(password);
         if (self.will_topic) |topic| self.allocator.free(topic);
         if (self.will_payload) |payload| self.allocator.free(payload);
+
         // 释放客户端标识符(如果已分配)
+        // 注意：Arena 分配的 Client 会由 Arena.deinit() 自动释放
+        // 只有全局 allocator 分配的 orphan_client 才需要这里释放
         if (self.identifer.len > 0) self.allocator.free(self.identifer);
+
+        // ✅ Zig 0.15.2: deinit() 需要传入 allocator 参数
         self.subscriptions.deinit(self.allocator);
         self.incoming_queue.deinit(self.allocator);
         self.outgoing_queue.deinit(self.allocator);
         self.user_properties.deinit();
         self.inflight_messages.deinit();
-        self.allocator.destroy(self);
+
+        // 注意：不要调用 allocator.destroy(self)
+        // 因为这个方法可能被 Arena 分配的 Client 调用（虽然不应该）
+        // 调用者负责 destroy
     }
 
     pub fn connect(self: *Client, identifer: []u8, protocol_version: ?ProtocolVersion, clean_start: bool, session_expiry_interval: u32, keep_alive: u16) void {
