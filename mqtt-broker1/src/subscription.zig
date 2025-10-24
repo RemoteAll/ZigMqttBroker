@@ -42,6 +42,11 @@ pub const SubscriptionTree = struct {
                 // 新增订阅：增加引用计数
                 _ = client.retain();
                 try self.subscribers.append(allocator, client);
+
+                // ✅ 建立反向索引：记录客户端订阅了这个节点
+                // 使用 anyopaque 避免循环依赖，在 replaceClientPointer 时转换回 *Node
+                try client.subscribed_nodes.append(client.allocator, @ptrCast(self));
+
                 return;
             }
 
@@ -79,6 +84,17 @@ pub const SubscriptionTree = struct {
                 while (i < self.subscribers.items.len) {
                     if (self.subscribers.items[i].id == client.id) {
                         const removed_client = self.subscribers.swapRemove(i);
+
+                        // ✅ 清理反向索引：从客户端的 subscribed_nodes 中移除这个节点
+                        const self_ptr: *anyopaque = @ptrCast(self);
+                        var node_idx: usize = 0;
+                        while (node_idx < removed_client.subscribed_nodes.items.len) {
+                            if (removed_client.subscribed_nodes.items[node_idx] == self_ptr) {
+                                _ = removed_client.subscribed_nodes.swapRemove(node_idx);
+                                break; // 每个节点只会出现一次
+                            }
+                            node_idx += 1;
+                        }
 
                         // 释放引用计数
                         const should_cleanup = removed_client.release();
@@ -440,9 +456,24 @@ pub const SubscriptionTree = struct {
 
     /// 替换订阅树中的 Client 指针
     /// 用于 Clean Session = 0 断开时将 Client 对象从 Arena 转移到全局 allocator
-    /// 遍历整个订阅树，将所有指向 old_client 的引用替换为 new_client
+    /// 使用反向索引优化:仅遍历客户端订阅的节点,而非整棵树
+    /// 性能优化: O(N×M) → O(M),其中 M 为该客户端的订阅数(通常 3-10 个)
     pub fn replaceClientPointer(self: *SubscriptionTree, old_client: *Client, new_client: *Client) !void {
-        const replaced_count = self.root.replaceClientPointerRecursive(old_client, new_client);
+        var replaced_count: usize = 0;
+
+        // 使用反向索引:仅遍历该客户端订阅的节点
+        for (old_client.subscribed_nodes.items) |node_ptr| {
+            const node: *Node = @ptrCast(@alignCast(node_ptr));
+
+            // 在该节点的订阅者列表中替换指针
+            for (node.subscribers.items) |*client_ptr| {
+                if (client_ptr.* == old_client) {
+                    client_ptr.* = new_client;
+                    replaced_count += 1;
+                    break; // 每个节点只会有一个实例
+                }
+            }
+        }
 
         if (replaced_count > 0) {
             logger.info("Replaced {} client pointer(s) in subscription tree for client {s}", .{ replaced_count, old_client.identifer });
@@ -450,8 +481,12 @@ pub const SubscriptionTree = struct {
             logger.warn("No client pointers found to replace for client {s}", .{old_client.identifer});
         }
 
-        // ⚠️ 关键：立即清理缓存，避免缓存中的悬垂指针
-        // 仅 bump 版本号是不够的，必须立即清理包含旧指针的缓存项
+        // 将反向索引转移到新客户端
+        new_client.subscribed_nodes = old_client.subscribed_nodes;
+        old_client.subscribed_nodes = .{};
+
+        // ⚠️ 关键:立即清理缓存,避免缓存中的悬垂指针
+        // 仅 bump 版本号是不够的,必须立即清理包含旧指针的缓存项
         self.bumpCacheVersion();
         self.cleanStaleCache();
     }

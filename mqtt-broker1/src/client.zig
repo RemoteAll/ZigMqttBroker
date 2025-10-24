@@ -54,6 +54,11 @@ pub const Client = struct {
     // Subscriptions
     subscriptions: std.ArrayList(Subscription),
 
+    // 反向索引：记录该客户端订阅了订阅树中的哪些节点
+    // 用于快速替换指针，避免遍历整棵订阅树
+    // 性能优化：断开时替换指针从 O(N×M) → O(M)，M=订阅数
+    subscribed_nodes: std.ArrayList(*anyopaque), // 存储 *SubscriptionTree.Node，但这里用 anyopaque 避免循环依赖
+
     // Message queues
     incoming_queue: std.ArrayList(Message),
     outgoing_queue: std.ArrayList(Message),
@@ -181,6 +186,7 @@ pub const Client = struct {
             .will_delay_interval = 0,
             // ✅ Zig 0.15.2: 使用空字面量初始化 ArrayList
             .subscriptions = .{},
+            .subscribed_nodes = .{}, // 反向索引初始化为空
             .incoming_queue = .{},
             .outgoing_queue = .{},
             .receive_maximum = 65535,
@@ -237,6 +243,7 @@ pub const Client = struct {
 
         // ✅ Zig 0.15.2: deinit() 需要传入 allocator 参数
         self.subscriptions.deinit(self.allocator);
+        self.subscribed_nodes.deinit(self.allocator); // 清理反向索引
         self.incoming_queue.deinit(self.allocator);
         self.outgoing_queue.deinit(self.allocator);
         self.user_properties.deinit();
