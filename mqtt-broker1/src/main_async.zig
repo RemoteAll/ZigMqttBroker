@@ -739,7 +739,7 @@ const ClientConnection = struct {
         // TODO: 实现 pending_qos2_messages 映射
     }
 
-    /// 转发给单个订阅者
+    /// 转发给单个订阅者 - 异步版本
     fn forwardToSingle(self: *ClientConnection, subscriber: *Client, publish_packet: anytype) !void {
         if (!subscriber.is_connected) return;
 
@@ -749,7 +749,14 @@ const ClientConnection = struct {
             return;
         };
 
-        // 使用订阅者自己的 writer 来发送消息
+        // 检查订阅者是否正在发送(避免覆盖发送缓冲区)
+        if (subscriber_conn.is_sending) {
+            logger.warn("Subscriber {s} is busy sending, message dropped", .{subscriber.identifer});
+            self.broker.metrics.incMessageDropped();
+            return;
+        }
+
+        // 使用订阅者自己的 writer 来构建消息
         subscriber_conn.writer.reset();
         try publish.writePublish(
             subscriber_conn.writer,
@@ -761,28 +768,27 @@ const ClientConnection = struct {
             null,
         );
 
-        const bytes_sent = subscriber_conn.writer.pos;
-
-        // TODO: 转发消息也应改为异步
-        // 当前暂时保留同步方式,避免与当前连接的发送缓冲区冲突
-        try subscriber_conn.writer.writeToStream(&subscriber.stream);
+        // 异步发送
+        subscriber_conn.sendAsync() catch |err| {
+            logger.err("Failed to forward to {s}: {any}", .{ subscriber.identifer, err });
+            self.broker.metrics.incNetworkError();
+            return;
+        };
 
         // 记录转发指标
         self.broker.metrics.incPublishSent();
-        self.broker.metrics.incMessageSent(bytes_sent);
-
-        logger.debug("Forwarded to {s}", .{subscriber.identifer});
+        logger.debug("Forwarded to {s} (async)", .{subscriber.identifer});
     }
 
-    /// 顺序转发给多个订阅者（高性能版本：共享序列化结果）
+    /// 顺序转发给多个订阅者 - 异步版本(共享序列化结果)
     fn forwardSequentially(self: *ClientConnection, subscribers: []*Client, publish_packet: anytype) !void {
         // 性能优化：先构建一次 PUBLISH 包，然后共享给所有订阅者
-        // 对于大规模订阅（100万+设备），避免重复序列化
+        // 避免重复序列化,节省 CPU 和内存
 
-        // 1. 使用发布者的 writer 构建一次 PUBLISH 包
-        self.writer.reset();
+        // 1. 使用临时 arena 分配器构建一次 PUBLISH 包
+        var temp_writer = try packet.Writer.init(self.arena.allocator());
         try publish.writePublish(
-            self.writer,
+            temp_writer,
             publish_packet.topic,
             publish_packet.payload,
             .AtMostOnce,
@@ -791,12 +797,13 @@ const ClientConnection = struct {
             null,
         );
 
-        // 2. 获取序列化后的字节切片（零拷贝共享）
-        const serialized_message = self.writer.buffer[0..self.writer.pos];
+        // 2. 获取序列化后的字节切片（共享给所有订阅者）
+        const serialized_message = temp_writer.buffer[0..temp_writer.pos];
         const message_size = serialized_message.len;
 
-        // 3. 将预序列化的消息直接发送给所有订阅者
+        // 3. 异步发送给所有订阅者
         var sent_count: usize = 0;
+        var dropped_count: usize = 0;
         var error_count: usize = 0;
 
         for (subscribers) |subscriber| {
@@ -809,43 +816,58 @@ const ClientConnection = struct {
                 continue;
             };
 
-            // 直接写入预序列化的字节流（零拷贝）
-            subscriber_conn.client.stream.writeAll(serialized_message) catch |err| {
-                logger.err("Failed to forward to {s}: {any}", .{ subscriber.identifer, err });
-                self.broker.metrics.incNetworkError();
+            // 检查是否正在发送(避免覆盖发送缓冲区)
+            if (subscriber_conn.is_sending) {
+                logger.debug("Subscriber {s} busy, message dropped", .{subscriber.identifer});
+                dropped_count += 1;
+                self.broker.metrics.incMessageDropped();
+                continue;
+            }
+
+            // 检查缓冲区大小
+            if (message_size > subscriber_conn.send_buffer.len) {
+                logger.err("Message too large for {s}: {} > {}", .{ subscriber.identifer, message_size, subscriber_conn.send_buffer.len });
                 error_count += 1;
                 continue;
-            };
+            }
+
+            // 直接复制预序列化的消息到订阅者的发送缓冲区
+            @memcpy(subscriber_conn.send_buffer[0..message_size], serialized_message);
+            subscriber_conn.send_len = message_size;
+            subscriber_conn.is_sending = true;
+
+            // 提交异步发送请求
+            subscriber_conn.state = .Writing;
+            self.broker.io.send(
+                *ClientConnection,
+                subscriber_conn,
+                ClientConnection.onSendComplete,
+                &subscriber_conn.send_completion,
+                subscriber_conn.socket,
+                subscriber_conn.send_buffer[0..message_size],
+            );
 
             // 记录转发指标
             self.broker.metrics.incPublishSent();
-            self.broker.metrics.incMessageSent(message_size);
             sent_count += 1;
         }
 
-        // 批量日志记录（避免100万次日志调用）
+        // 批量日志记录（避免过多日志调用）
         if (sent_count > 10) {
-            logger.info("Forwarded to {d} subscribers ({d} errors)", .{ sent_count, error_count });
-        } else {
-            for (subscribers) |subscriber| {
-                if (subscriber.is_connected) {
-                    logger.debug("Forwarded to {s}", .{subscriber.identifer});
-                }
-            }
+            logger.info("Forwarded to {d} subscribers ({d} dropped, {d} errors)", .{ sent_count, dropped_count, error_count });
+        } else if (sent_count > 0) {
+            logger.debug("Forwarded to {d} subscribers", .{sent_count});
         }
     }
 
-    /// 批量 I/O 转发（优化版本：减少系统调用次数）
-    /// 性能提升：将订阅者分批处理，每批进行一次批量 I/O 操作
-    /// 适用场景：大量订阅者（config.BATCH_FORWARD_THRESHOLD+）时，显著减少内核态切换开销
+    /// 批量异步转发 - 高性能版本
+    /// 充分利用 io_uring 的批量提交能力
+    /// 适用场景：大量订阅者（config.BATCH_FORWARD_THRESHOLD+）
     fn forwardBatched(self: *ClientConnection, subscribers: []*Client, publish_packet: anytype) !void {
-        // 批量大小：从配置文件读取，允许运行时调优
-        const BATCH_SIZE = config.FORWARD_BATCH_SIZE;
-
         // 1. 序列化一次 PUBLISH 包（共享序列化结果）
-        self.writer.reset();
+        var temp_writer = try packet.Writer.init(self.arena.allocator());
         try publish.writePublish(
-            self.writer,
+            temp_writer,
             publish_packet.topic,
             publish_packet.payload,
             .AtMostOnce,
@@ -854,50 +876,64 @@ const ClientConnection = struct {
             null,
         );
 
-        const serialized_message = self.writer.buffer[0..self.writer.pos];
+        const serialized_message = temp_writer.buffer[0..temp_writer.pos];
         const message_size = serialized_message.len;
 
         var total_sent: usize = 0;
+        var total_dropped: usize = 0;
         var total_errors: usize = 0;
 
-        // 2. 分批处理订阅者
-        var batch_start: usize = 0;
-        while (batch_start < subscribers.len) {
-            const batch_end = @min(batch_start + BATCH_SIZE, subscribers.len);
-            const current_batch = subscribers[batch_start..batch_end];
+        // 2. 批量异步发送给所有订阅者
+        // io_uring 会自动批量提交,充分利用 SQ (Submission Queue) 的批处理能力
+        for (subscribers) |subscriber| {
+            if (!subscriber.is_connected) continue;
 
-            // 3. 批量发送当前批次
-            for (current_batch) |subscriber| {
-                if (!subscriber.is_connected) continue;
+            // 查找订阅者连接
+            const subscriber_conn = self.broker.clients.get(subscriber.identifer) orelse {
+                logger.warn("Subscriber {s} not found in broker clients map", .{subscriber.identifer});
+                total_errors += 1;
+                continue;
+            };
 
-                // 查找订阅者连接
-                const subscriber_conn = self.broker.clients.get(subscriber.identifer) orelse {
-                    logger.warn("Subscriber {s} not found in broker clients map", .{subscriber.identifer});
-                    total_errors += 1;
-                    continue;
-                };
-
-                // 批量写入（这里可以进一步优化为真正的 writev/scatter-gather I/O）
-                subscriber_conn.client.stream.writeAll(serialized_message) catch |err| {
-                    logger.err("Failed to forward to {s}: {any}", .{ subscriber.identifer, err });
-                    self.broker.metrics.incNetworkError();
-                    total_errors += 1;
-                    continue;
-                };
-
-                // 记录指标
-                self.broker.metrics.incPublishSent();
-                self.broker.metrics.incMessageSent(message_size);
-                total_sent += 1;
+            // 检查是否正在发送
+            if (subscriber_conn.is_sending) {
+                logger.debug("Subscriber {s} busy, message dropped", .{subscriber.identifer});
+                total_dropped += 1;
+                self.broker.metrics.incMessageDropped();
+                continue;
             }
 
-            batch_start = batch_end;
+            // 检查缓冲区大小
+            if (message_size > subscriber_conn.send_buffer.len) {
+                logger.err("Message too large for {s}: {} > {}", .{ subscriber.identifer, message_size, subscriber_conn.send_buffer.len });
+                total_errors += 1;
+                continue;
+            }
+
+            // 复制消息到订阅者的发送缓冲区
+            @memcpy(subscriber_conn.send_buffer[0..message_size], serialized_message);
+            subscriber_conn.send_len = message_size;
+            subscriber_conn.is_sending = true;
+
+            // 提交异步发送请求
+            // io_uring 会将多个请求批量提交到内核,减少系统调用开销
+            subscriber_conn.state = .Writing;
+            self.broker.io.send(
+                *ClientConnection,
+                subscriber_conn,
+                ClientConnection.onSendComplete,
+                &subscriber_conn.send_completion,
+                subscriber_conn.socket,
+                subscriber_conn.send_buffer[0..message_size],
+            );
+
+            // 记录指标
+            self.broker.metrics.incPublishSent();
+            total_sent += 1;
         }
 
-        // 4. 批量日志记录
-        if (total_sent > 10) {
-            logger.info("Batched forward to {d} subscribers ({d} errors)", .{ total_sent, total_errors });
-        }
+        // 3. 批量日志记录
+        logger.info("Batched async forward to {d} subscribers ({d} dropped, {d} errors)", .{ total_sent, total_dropped, total_errors });
     }
 
     /// 断开连接
