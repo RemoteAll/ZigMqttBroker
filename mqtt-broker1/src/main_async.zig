@@ -569,11 +569,17 @@ const ClientConnection = struct {
     }
 
     fn handlePingreq(self: *ClientConnection) !void {
+        logger.info("📡 Received PINGREQ from client {} ({s})", .{ self.id, self.client.identifer });
         self.writer.reset();
         try self.writer.writeByte(0xD0); // PINGRESP 包类型
         try self.writer.writeByte(0); // Remaining length = 0
-        try self.writer.writeToStream(&self.client.stream);
-        logger.debug("Client {d} PINGREQ -> PINGRESP", .{self.id});
+
+        self.writer.writeToStream(&self.client.stream) catch |err| {
+            std.log.err("❌ CRITICAL: Failed to write PINGRESP to stream: {any}", .{err});
+            std.log.err("   Client {} will timeout and reconnect!", .{self.id});
+            return error.StreamWriteError;
+        };
+        logger.info("✅ PINGRESP sent successfully to client {}", .{self.id});
     }
 
     /// 处理 PUBACK (QoS 1 发布确认)

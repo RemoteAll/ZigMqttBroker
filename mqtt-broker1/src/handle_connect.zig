@@ -286,9 +286,12 @@ pub fn connack(writer: *packet.Writer, stream: *net.Stream, reason_code: mqtt.Re
     try writer.finishPacket();
 
     writer.writeToStream(stream) catch |err| {
-        std.log.err("Failed to write CONNACK to stream: {any}", .{err});
+        std.log.err("❌ CRITICAL: Failed to write CONNACK to stream: {any}", .{err});
+        std.log.err("   This will cause client timeout and reconnection!", .{});
         return error.StreamWriteError;
     };
+
+    std.log.info("✅ CONNACK sent successfully", .{});
 
     std.debug.print("----------------\n", .{});
 }

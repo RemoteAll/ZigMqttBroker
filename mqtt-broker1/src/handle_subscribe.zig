@@ -102,7 +102,10 @@ pub fn suback(writer: *packet.Writer, stream: *net.Stream, packet_id: u16, clien
     try writer.finishPacket();
 
     writer.writeToStream(stream) catch |err| {
-        std.log.err("Failed to write SUBACK to stream: {any}", .{err});
+        std.log.err("❌ CRITICAL: Failed to write SUBACK to stream: {any}", .{err});
+        std.log.err("   This will cause client timeout and reconnection!", .{});
         return error.StreamWriteError;
     };
+
+    std.log.info("✅ SUBACK sent successfully to client {}", .{client.id});
 }
