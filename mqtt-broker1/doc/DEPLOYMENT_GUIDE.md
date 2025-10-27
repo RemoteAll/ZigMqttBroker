@@ -30,6 +30,8 @@ zig build -Doptimize=ReleaseSafe
 
 ### 1.3 跨平台编译
 
+#### 1.3.1 通用跨平台编译
+
 ```powershell
 # Linux x86_64
 zig build -Dtarget=x86_64-linux -Doptimize=ReleaseFast
@@ -39,6 +41,55 @@ zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast
 
 # Windows ARM64
 zig build -Dtarget=aarch64-windows -Doptimize=ReleaseFast
+```
+
+#### 1.3.2 ARM 架构编译（用于路由器部署）
+
+**ARM v5**（适合旧款路由器，如 TP-Link 早期版本）
+
+```powershell
+zig build -Darm=v5 -Doptimize=ReleaseFast
+```
+
+**ARM v7**（适合现代路由器，推荐，如 TP-Link Archer 系列、OpenWrt 18.06+）
+
+```powershell
+zig build -Darm=v7 -Doptimize=ReleaseFast
+```
+
+**ARM v7 超小二进制**（适合存储空间极其紧张的场景）
+
+```powershell
+zig build -Darm=v7 -Doptimize=ReleaseSmall
+```
+
+**编译参数说明：**
+
+| 参数 | 说明 |
+|------|------|
+| `-Darm=v5` | 交叉编译到 ARM v5（musl libc） |
+| `-Darm=v7` | 交叉编译到 ARM v7（musleabihf，硬浮点） |
+| `-Doptimize=ReleaseFast` | 性能优先（推荐） |
+| `-Doptimize=ReleaseSmall` | 体积优先（存储有限） |
+
+**ARM 版本选择指南：**
+
+| 路由器类型 | 推荐架构 | 说明 |
+|----------|--------|------|
+| OpenWrt 12.09 或更早 | ARM v5 | 旧版本固件 |
+| OpenWrt 18.06 及以后 | ARM v7 | 现代版本，性能更好 |
+| TP-Link WR741N/WR842N | ARM v5 | 经典款，旧指令集 |
+| TP-Link Archer C系列 | ARM v7 | 现代款，支持硬浮点 |
+| ASUS 高端路由 | ARM v7 | 一般都是 v7 或更新 |
+
+**验证编译结果：**
+
+```powershell
+# 查看文件信息
+file zig-out/bin/mqtt-broker
+
+# 查看 ELF 架构信息（需要 readelf 工具）
+readelf -h zig-out/bin/mqtt-broker
 ```
 
 ### 1.4 输出文件位置
