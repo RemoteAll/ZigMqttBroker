@@ -71,7 +71,7 @@ pub const MAX_TOPIC_LEVELS = 16;
 // ========================================================================
 // 监控配置
 // ========================================================================
-pub const STATS_PUBLISH_INTERVAL_SEC = 5; // 统计信息发布间隔(秒)
+pub const STATS_PUBLISH_INTERVAL_SEC = 60; // 统计信息发布间隔(秒) - 1分钟输出一次
 pub const STATS_INTERVAL_NS = STATS_PUBLISH_INTERVAL_SEC * std.time.ns_per_s; // 纳秒单位
 
 // ========================================================================
