@@ -67,6 +67,11 @@ const ClientConnection = struct {
     // 防止重复断开连接
     is_disconnecting: bool = false,
 
+    /// ⚠️ 关键：保存此连接的 Clean Session 标志
+    /// 因为 Client 对象可能被多个连接共享，不能依赖 client.clean_start
+    /// 每个连接在断开时必须根据自己的 clean_session 标志来决定是否清理订阅
+    connection_clean_session: bool = false,
+
     pub fn init(
         base_allocator: Allocator,
         id: u64,
@@ -106,6 +111,7 @@ const ClientConnection = struct {
             .is_sending = false,
             .arena = arena,
             .is_disconnecting = false,
+            .connection_clean_session = false, // 初始化为 false，在 CONNECT 时设置
         };
 
         return self;
@@ -486,6 +492,9 @@ const ClientConnection = struct {
         self.client.keep_alive = connect_packet.keep_alive;
         self.client.clean_start = connect_packet.connect_flags.clean_session;
 
+        // ⚠️ 关键：保存此连接的 Clean Session 标志（不依赖共享的 Client 对象）
+        self.connection_clean_session = connect_packet.connect_flags.clean_session;
+
         // 设置会话过期时间
         // MQTT 3.1.1: 使用服务器配置的默认值（协议本身不支持此字段）
         // MQTT 5.0: 应该从 CONNECT 包的属性中读取（待实现）
@@ -521,6 +530,10 @@ const ClientConnection = struct {
             break :blk false;
         };
 
+        // 标记是否需要从持久化恢复订阅
+        // 只有在以下情况才需要恢复：没有活跃旧连接（新连接）但有持久化订阅
+        var needs_restore_from_persistence = false;
+
         if (self.broker.clients.get(mqtt_client_id)) |old_conn| {
             logger.info("Client {s} is reconnecting (old_conn #{d}), handling session...", .{ mqtt_client_id, old_conn.id });
 
@@ -530,16 +543,28 @@ const ClientConnection = struct {
                 logger.info("Clean Session = 1, clearing old subscriptions for {s}", .{mqtt_client_id});
                 self.broker.subscriptions.unsubscribeAll(old_conn.client);
             } else {
-                // Clean Session = 0: 保留订阅，但需要更新订阅树中的 Client 指针
-                // 这样订阅树中的指针指向新的 Client 对象
-                logger.info("Clean Session = 0, preserving subscriptions for {s}", .{mqtt_client_id});
-                // 订阅树中的 *Client 指针会在下面的 put 操作后自动指向新的 client
+                // Clean Session = 0: 复用旧连接的 Client 对象,保留订阅指针有效
+                logger.info("Clean Session = 0, reusing old Client object for {s}", .{mqtt_client_id});
+
+                // ⚠️ 关键修复：复用旧的 Client 对象,避免订阅树中的指针失效
+                // 旧的 client 指针已经在订阅树中被引用,必须保持其有效性
+                self.client = old_conn.client;
+                self.client.is_connected = true; // 恢复连接状态
+
+                // 重要：复用旧 Client 时，订阅已经在内存中，不需要从持久化恢复
+                needs_restore_from_persistence = false;
             }
 
             // 关闭旧连接的 socket 和网络资源
             self.broker.io.close_socket(old_conn.socket);
-            // 注意：不调用 old_conn.deinit()，因为订阅树可能还在引用 old_conn.client
-            // 而是让新连接复用旧会话的 Client 对象
+            // 注意：Clean Session = 0 时不释放 old_conn.client，因为我们复用了它
+        } else {
+            // 没有活跃的旧连接
+            if (!connect_packet.connect_flags.clean_session and has_persisted_subscriptions) {
+                // Clean Session = 0 且有持久化订阅，需要恢复
+                needs_restore_from_persistence = true;
+                logger.info("Client {s} is new connection with persisted subscriptions, will restore", .{mqtt_client_id});
+            }
         }
 
         // 将新连接注册到 broker（重连时会替换旧连接）
@@ -574,11 +599,15 @@ const ClientConnection = struct {
             session_present,
         });
 
-        // 如果 session_present = true，恢复持久化的订阅到主题树
-        if (session_present and !connect_packet.connect_flags.clean_session) {
+        // 只有在明确需要从持久化恢复时才调用 restoreClientSubscriptions
+        // 避免重复恢复（复用旧 Client 对象时订阅已经在内存中）
+        if (needs_restore_from_persistence) {
+            logger.info("Restoring subscriptions from persistence for client {s}", .{self.client.identifer});
             self.broker.subscriptions.restoreClientSubscriptions(self.client) catch |err| {
                 logger.err("Failed to restore subscriptions for client {s}: {any}", .{ self.client.identifer, err });
             };
+        } else if (has_existing_session and !connect_packet.connect_flags.clean_session) {
+            logger.info("Client {s} reused old Client object, subscriptions already in memory", .{self.client.identifer});
         }
     }
 
@@ -946,7 +975,7 @@ const ClientConnection = struct {
         self.is_disconnecting = true;
 
         self.state = .Disconnecting;
-        logger.info("Client {d} ({s}) disconnecting (clean_start={})", .{ self.id, self.client.identifer, self.client.clean_start });
+        logger.info("Client {d} ({s}) disconnecting (connection_clean_session={})", .{ self.id, self.client.identifer, self.connection_clean_session });
 
         // 记录连接关闭
         self.broker.metrics.incConnectionClosed();
@@ -957,10 +986,11 @@ const ClientConnection = struct {
         // 记录断开时间（用于会话过期判断）
         self.client.disconnect_time = std.time.milliTimestamp();
 
-        // 根据 Clean Session 标志决定是否清理订阅
+        // ⚠️ 关键修复：根据此连接的 clean_session 标志决定是否清理订阅
+        // 不能依赖 self.client.clean_start，因为 Client 对象可能被多个连接共享
         // [MQTT-3.1.2-6] Clean Session = 1: 断开时必须删除会话状态
         // [MQTT-3.1.2-5] Clean Session = 0: 断开时保留会话状态
-        if (self.client.clean_start) {
+        if (self.connection_clean_session) {
             // Clean Session = 1: 清理订阅(从主题树和持久化)
             logger.info("Client {s} disconnecting with Clean Session = 1, clearing all subscriptions", .{self.client.identifer});
             self.broker.subscriptions.unsubscribeAll(self.client);
