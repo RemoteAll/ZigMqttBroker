@@ -135,8 +135,10 @@ pub const IO = struct {
                 try self.flush_submissions(0, &timeouts, &etime);
                 break :blk self.ring.get_sqe() catch unreachable;
             };
-            // Submit an absolute timeout that will be canceled if any other SQE completes first:
-            timeout_sqe.prep_timeout(&timeout_ts, 1, os.linux.IORING_TIMEOUT_ABS);
+            // 提交绝对时间超时: count=0 表示无条件等待直到时间到期或有事件完成
+            // 原代码使用 count=1 导致空载时立即返回(认为没有可等待的事件),造成 busy-wait
+            // 修复: 改为 count=0,让内核真正阻塞直到超时或任何事件到达
+            timeout_sqe.prep_timeout(&timeout_ts, 0, os.linux.IORING_TIMEOUT_ABS);
             timeout_sqe.user_data = 0;
             timeouts += 1;
 
