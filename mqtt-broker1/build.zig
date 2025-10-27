@@ -10,11 +10,13 @@ pub fn build(b: *std.Build) void {
     // 根据 ARM 版本构建 target
     var target: std.Build.ResolvedTarget = undefined;
     if (std.mem.eql(u8, arm_version, "v5")) {
+        // ARMv5TE: 支持 Thumb 指令集，兼容性更好
+        // 适用于较老的 ARM 设备，如 ARMv5TE 架构的嵌入式系统
         target = b.resolveTargetQuery(.{
             .cpu_arch = .arm,
             .os_tag = .linux,
-            .abi = .musl,
-            .cpu_model = .{ .explicit = &std.Target.arm.cpu.generic },
+            .abi = .musleabi,
+            .cpu_model = .{ .explicit = &std.Target.arm.cpu.arm1176jzf_s },
         });
     } else if (std.mem.eql(u8, arm_version, "v7")) {
         target = b.resolveTargetQuery(.{
@@ -33,9 +35,23 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
+    // 根据目标平台生成文件名后缀
+    const target_suffix = blk: {
+        if (std.mem.eql(u8, arm_version, "v5")) {
+            break :blk "-armv5";
+        } else if (std.mem.eql(u8, arm_version, "v7")) {
+            break :blk "-armv7";
+        } else if (target.result.cpu.arch == .x86_64 and target.result.os.tag == .linux) {
+            break :blk "-linux-x64";
+        } else {
+            break :blk "";
+        }
+    };
+
     // 异步版本 (使用 iobeetle IO) - 作为默认编译目标
+    const async_name = b.fmt("mqtt-broker{s}", .{target_suffix});
     const exe_async = b.addExecutable(.{
-        .name = "mqtt-broker",
+        .name = async_name,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main_async.zig"),
             .target = target,
@@ -43,8 +59,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const sync_name = b.fmt("mqtt-broker-sync{s}", .{sync_name_suffix: {
+        break :sync_name_suffix target_suffix;
+    }});
     const exe = b.addExecutable(.{
-        .name = "mqtt-broker-sync",
+        .name = sync_name,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
