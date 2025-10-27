@@ -164,18 +164,24 @@ const ClientConnection = struct {
 
         const length = result catch |err| {
             // 区分不同类型的错误
-            switch (err) {
-                // 正常的断开/取消操作 - 使用 DEBUG 级别
-                error.OperationCancelled => {
-                    // CancelIoEx 取消的操作 - 这是我们主动调用的，完全正常
-                    logger.debug("Client {d} recv operation cancelled (normal disconnect)", .{self.id});
-                },
+            const is_windows = @import("builtin").os.tag == .windows;
+
+            // 使用 comptime 检查错误类型以支持跨平台编译
+            const is_operation_cancelled = if (is_windows)
+                err == error.OperationCancelled
+            else
+                false;
+
+            if (is_operation_cancelled) {
+                // Windows 特有: CancelIoEx 取消的操作 - 这是我们主动调用的，完全正常
+                logger.debug("Client {d} recv operation cancelled (normal disconnect)", .{self.id});
+            } else switch (err) {
                 error.SocketNotConnected => {
                     // Socket 已关闭或未连接 - 断开流程中的正常情况
                     logger.debug("Client {d} recv error (socket not connected)", .{self.id});
                 },
                 error.Unexpected => {
-                    // Windows socket 关闭导致的其他错误
+                    // Windows/Linux: socket 关闭导致的其他错误
                     logger.debug("Client {d} recv error (unexpected): {any}", .{ self.id, err });
                 },
                 error.ConnectionResetByPeer => {
@@ -1193,19 +1199,9 @@ pub const MqttBroker = struct {
             // 注意：任何网络事件（连接、数据到达等）都会立即中断等待
             self.io.run_for_ns(30 * std.time.ns_per_s) catch |err| {
                 // IO 错误通常是由于已关闭的 socket 触发的，这是正常的断开流程
-                // 只记录非预期的严重错误，其他错误忽略以保持服务器运行
-                switch (err) {
-                    error.Unexpected => {
-                        // Socket 已关闭导致的 Unexpected 错误（如 WSAENOTSOCK）是正常的
-                        // 不需要记录，继续运行
-                        logger.debug("IO unexpected error (likely closed socket): {any}", .{err});
-                    },
-                    else => {
-                        // 其他严重错误才需要关注
-                        logger.err("IO critical error: {any}", .{err});
-                        // 继续运行而不是退出，让服务器保持可用
-                    },
-                }
+                // 记录错误但继续运行，保持服务器可用
+                logger.debug("IO error (likely closed socket or transient issue): {any}", .{err});
+                // 继续运行而不是退出，让服务器保持可用
             };
         }
     }
