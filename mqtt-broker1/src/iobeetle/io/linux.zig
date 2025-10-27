@@ -671,7 +671,7 @@ pub const IO = struct {
                                 .SPIPE => error.Unseekable,
                                 .TIMEDOUT => error.ConnectionTimedOut,
                                 else => |errno| {
-                                    std.log.err("read errno: {any}", .{errno});
+                                    log.err("read unexpected errno: {s} (value={})", .{ @tagName(errno), @intFromEnum(errno) });
                                     break :blk error.Unexpected;
                                 },
                             };
@@ -702,7 +702,7 @@ pub const IO = struct {
                                 .TIMEDOUT => error.ConnectionTimedOut,
                                 .OPNOTSUPP => error.OperationNotSupported,
                                 else => |errno| {
-                                    std.log.err("recv errno: {any}", .{errno});
+                                    log.err("recv unexpected errno: {s} (value={})", .{ @tagName(errno), @intFromEnum(errno) });
                                     break :blk error.Unexpected;
                                 },
                             };
@@ -742,7 +742,7 @@ pub const IO = struct {
                                 .PIPE => error.BrokenPipe,
                                 .TIMEDOUT => error.ConnectionTimedOut,
                                 else => |errno| {
-                                    std.log.err("send errno: {any}", .{errno});
+                                    log.err("send unexpected errno: {s} (value={})", .{ @tagName(errno), @intFromEnum(errno) });
                                     break :blk error.Unexpected;
                                 },
                             };
@@ -822,7 +822,7 @@ pub const IO = struct {
                                 .PIPE => error.BrokenPipe,
                                 .SPIPE => error.Unseekable,
                                 else => |errno| {
-                                    std.log.err("write errno: {any}", .{errno});
+                                    log.err("write unexpected errno: {s} (value={})", .{ @tagName(errno), @intFromEnum(errno) });
                                     break :blk error.Unexpected;
                                 },
                             };
