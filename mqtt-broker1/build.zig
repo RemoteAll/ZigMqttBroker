@@ -64,6 +64,79 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe_async);
     b.installArtifact(exe_sync);
 
+    // 添加交叉编译目标（针对不同平台和架构）
+    const cross_targets = [_]std.Target.Query{
+        // Linux ARMv7 (32位) - 适用于树莓派等设备
+        .{
+            .cpu_arch = .arm,
+            .os_tag = .linux,
+            .abi = .gnueabihf,
+            .cpu_model = .{ .explicit = &std.Target.arm.cpu.generic },
+            .cpu_features_add = std.Target.arm.featureSet(&.{
+                .v7a,
+                .vfp3,
+                .neon,
+            }),
+        },
+        // Linux ARM64
+        .{
+            .cpu_arch = .aarch64,
+            .os_tag = .linux,
+            .abi = .gnu,
+        },
+        // Linux x86_64
+        .{
+            .cpu_arch = .x86_64,
+            .os_tag = .linux,
+            .abi = .gnu,
+        },
+    };
+
+    // 为每个目标创建交叉编译步骤
+    for (cross_targets) |cross_target| {
+        const cross_target_resolved = b.resolveTargetQuery(cross_target);
+
+        const cross_platform_suffix = blk: {
+            const os_name = switch (cross_target.os_tag.?) {
+                .linux => "linux",
+                .windows => "windows",
+                .macos => "macos",
+                else => "unknown",
+            };
+
+            const arch_name = switch (cross_target.cpu_arch.?) {
+                .x86_64 => "x86_64",
+                .aarch64 => "aarch64",
+                .arm => "armv7",
+                else => "unknown",
+            };
+
+            break :blk b.fmt("-{s}-{s}", .{ os_name, arch_name });
+        };
+
+        // 异步版本交叉编译
+        const cross_exe_async = b.addExecutable(.{
+            .name = b.fmt("mqtt-broker-async{s}", .{cross_platform_suffix}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main_async.zig"),
+                .target = cross_target_resolved,
+                .optimize = .ReleaseFast,
+            }),
+        });
+        b.installArtifact(cross_exe_async);
+
+        // 同步版本交叉编译
+        const cross_exe_sync = b.addExecutable(.{
+            .name = b.fmt("mqtt-broker-sync{s}", .{cross_platform_suffix}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = cross_target_resolved,
+                .optimize = .ReleaseFast,
+            }),
+        });
+        b.installArtifact(cross_exe_sync);
+    }
+
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish
     // such a dependency.

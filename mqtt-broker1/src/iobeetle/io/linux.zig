@@ -119,13 +119,14 @@ pub const IO = struct {
         // We must use the same clock source used by io_uring (CLOCK_MONOTONIC) since we specify the
         // timeout below as an absolute value. Otherwise, we may deadlock if the clock sources are
         // dramatically different. Any kernel that supports io_uring will support CLOCK_MONOTONIC.
-        // Zig 0.15.2 兼容性修�? clock_gettime 现在直接返回 timespec 而不是通过参数
+        // Zig 0.15.2 兼容性修复: clock_gettime 现在直接返回 timespec 而不是通过参数
         const current_ts = posix.clock_gettime(posix.CLOCK.MONOTONIC) catch unreachable;
         // The absolute CLOCK_MONOTONIC time after which we may return from this function:
-        // Zig 0.15.2 兼容性修�? kernel_timespec 字段名变�?
+        // Zig 0.15.2 兼容性修复: kernel_timespec 字段名变更
+        // ARMv7 兼容性修复: nsec 类型转换
         const timeout_ts: os.linux.kernel_timespec = .{
             .sec = current_ts.sec,
-            .nsec = current_ts.nsec + nanoseconds,
+            .nsec = @as(isize, @intCast(current_ts.nsec)) + @as(isize, @intCast(nanoseconds)),
         };
         var timeouts: usize = 0;
         var etime = false;
@@ -231,7 +232,8 @@ pub const IO = struct {
                     if (-cqe.res == @intFromEnum(posix.E.TIME)) etime.* = true;
                     continue;
                 }
-                const completion: *Completion = @ptrFromInt(cqe.user_data);
+                // ARMv7 兼容性: u64 -> usize 类型转换
+                const completion: *Completion = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
                 completion.result = cqe.res;
                 // We do not run the completion here (instead appending to a linked list) to avoid:
                 // * recursion through `flush_submissions()` and `flush_completions()`,
