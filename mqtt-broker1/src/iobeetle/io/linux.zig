@@ -119,12 +119,12 @@ pub const IO = struct {
         // We must use the same clock source used by io_uring (CLOCK_MONOTONIC) since we specify the
         // timeout below as an absolute value. Otherwise, we may deadlock if the clock sources are
         // dramatically different. Any kernel that supports io_uring will support CLOCK_MONOTONIC.
-        var current_ts: posix.timespec = undefined;
-        posix.clock_gettime(posix.CLOCK.MONOTONIC, &current_ts) catch unreachable;
+        const current_ts = posix.clock_gettime(posix.CLOCK.MONOTONIC) catch unreachable;
         // The absolute CLOCK_MONOTONIC time after which we may return from this function:
+        // 注意：Zig 0.15.2+ 中 timespec 和 kernel_timespec 都使用 sec/nsec 字段
         const timeout_ts: os.linux.kernel_timespec = .{
-            .tv_sec = current_ts.tv_sec,
-            .tv_nsec = current_ts.tv_nsec + nanoseconds,
+            .sec = @intCast(current_ts.sec),
+            .nsec = @intCast(current_ts.nsec + nanoseconds),
         };
         var timeouts: usize = 0;
         var etime = false;
@@ -175,8 +175,8 @@ pub const IO = struct {
         // 2) potentially queues more SQEs to take advantage more of the next flush_submissions().
         while (self.completed.pop()) |completion| {
             if (completion.operation == .timeout and
-                completion.operation.timeout.timespec.tv_sec == 0 and
-                completion.operation.timeout.timespec.tv_nsec == 0)
+                completion.operation.timeout.timespec.sec == 0 and
+                completion.operation.timeout.timespec.nsec == 0)
             {
                 // Zero-duration timeouts are a special case, and aren't listed in `awaiting`.
                 std.debug.assert(self.awaiting.empty() or !self.awaiting.empty());
@@ -477,7 +477,10 @@ pub const IO = struct {
                                 .ALREADY => error.NotInterruptable,
                                 // SQE is invalid.
                                 .INVAL => unreachable,
-                                else => |errno| std.log.err("cancel {any}", .{errno}),
+                                else => |errno| blk2: {
+                                    std.log.err("cancel unexpected error: {any}", .{errno});
+                                    break :blk2 posix.unexpectedErrno(errno);
+                                },
                             };
                         }
                     };
@@ -504,7 +507,10 @@ pub const IO = struct {
                                 .OPNOTSUPP => error.OperationNotSupported,
                                 .PERM => error.PermissionDenied,
                                 .PROTO => error.ProtocolFailure,
-                                else => |errno| std.log.err("accept {any}", .{errno}),
+                                else => |errno| blk2: {
+                                    std.log.err("accept unexpected error: {any}", .{errno});
+                                    break :blk2 posix.unexpectedErrno(errno);
+                                },
                             };
                             break :blk err;
                         } else {
@@ -523,7 +529,10 @@ pub const IO = struct {
                                 .DQUOT => error.DiskQuota,
                                 .IO => error.InputOutput,
                                 .NOSPC => error.NoSpaceLeft,
-                                else => |errno| std.log.err("close", .{errno}),
+                                else => |errno| blk2: {
+                                    std.log.err("close unexpected error: {any}", .{errno});
+                                    break :blk2 posix.unexpectedErrno(errno);
+                                },
                             };
                             break :blk err;
                         } else {
@@ -558,7 +567,10 @@ pub const IO = struct {
                                 .PERM => error.PermissionDenied,
                                 .PROTOTYPE => error.ProtocolNotSupported,
                                 .TIMEDOUT => error.ConnectionTimedOut,
-                                else => |errno| std.log.err("connect {any}", .{errno}),
+                                else => |errno| blk2: {
+                                    std.log.err("connect unexpected error: {any}", .{errno});
+                                    break :blk2 posix.unexpectedErrno(errno);
+                                },
                             };
                             break :blk err;
                         } else {
@@ -578,7 +590,10 @@ pub const IO = struct {
                                 .BADF => error.FileDescriptorInvalid,
                                 .IO => error.InputOutput,
                                 .INVAL => unreachable,
-                                else => |errno| std.log.err("fsync, {any}", .{errno}),
+                                else => |errno| blk2: {
+                                    std.log.err("fsync unexpected error: {any}", .{errno});
+                                    break :blk2 posix.unexpectedErrno(errno);
+                                },
                             };
                             break :blk err;
                         } else {
@@ -617,7 +632,10 @@ pub const IO = struct {
                                 .OPNOTSUPP => error.FileLocksNotSupported,
                                 .AGAIN => error.WouldBlock,
                                 .TXTBSY => error.FileBusy,
-                                else => |errno| std.log.err("openat {any}", .{errno}),
+                                else => |errno| blk2: {
+                                    std.log.err("openat unexpected error: {any}", .{errno});
+                                    break :blk2 posix.unexpectedErrno(errno);
+                                },
                             };
                             break :blk err;
                         } else {
@@ -648,7 +666,10 @@ pub const IO = struct {
                                 .OVERFLOW => error.Unseekable,
                                 .SPIPE => error.Unseekable,
                                 .TIMEDOUT => error.ConnectionTimedOut,
-                                else => |errno| std.log.err("read {any}", .{errno}),
+                                else => |errno| blk2: {
+                                    std.log.err("read unexpected error: {any}", .{errno});
+                                    break :blk2 posix.unexpectedErrno(errno);
+                                },
                             };
                             break :blk err;
                         } else {
@@ -676,7 +697,10 @@ pub const IO = struct {
                                 .CONNRESET => error.ConnectionResetByPeer,
                                 .TIMEDOUT => error.ConnectionTimedOut,
                                 .OPNOTSUPP => error.OperationNotSupported,
-                                else => |errno| std.log.err("recv {any}", .{errno}),
+                                else => |errno| blk2: {
+                                    std.log.err("recv unexpected error: {any}", .{errno});
+                                    break :blk2 posix.unexpectedErrno(errno);
+                                },
                             };
                             break :blk err;
                         } else {
@@ -713,7 +737,10 @@ pub const IO = struct {
                                 .OPNOTSUPP => error.OperationNotSupported,
                                 .PIPE => error.BrokenPipe,
                                 .TIMEDOUT => error.ConnectionTimedOut,
-                                else => |errno| std.log.err("send {any}", .{errno}),
+                                else => |errno| blk2: {
+                                    std.log.err("send unexpected error: {any}", .{errno});
+                                    break :blk2 posix.unexpectedErrno(errno);
+                                },
                             };
                             break :blk err;
                         } else {
@@ -739,7 +766,10 @@ pub const IO = struct {
                                 .NOENT => error.FileNotFound,
                                 .NOMEM => error.SystemResources,
                                 .NOTDIR => error.NotDir,
-                                else => |errno| std.log.err("statx {any}", .{errno}),
+                                else => |errno| blk2: {
+                                    std.log.err("statx unexpected error: {any}", .{errno});
+                                    break :blk2 posix.unexpectedErrno(errno);
+                                },
                             };
                             break :blk err;
                         } else {
@@ -757,7 +787,10 @@ pub const IO = struct {
                         },
                         .CANCELED => error.Canceled,
                         .TIME => {}, // A success.
-                        else => |errno| std.log.err("timeout {any}", .{errno}),
+                        else => |errno| blk2: {
+                            std.log.err("timeout unexpected error: {any}", .{errno});
+                            break :blk2 posix.unexpectedErrno(errno);
+                        },
                     };
                     const result: TimeoutError!void = err;
                     completion.callback(completion.context, completion, &result);
@@ -784,7 +817,10 @@ pub const IO = struct {
                                 .PERM => error.AccessDenied,
                                 .PIPE => error.BrokenPipe,
                                 .SPIPE => error.Unseekable,
-                                else => |errno| std.log.err("write {any}", .{errno}),
+                                else => |errno| blk2: {
+                                    std.log.err("write unexpected error: {any}", .{errno});
+                                    break :blk2 posix.unexpectedErrno(errno);
+                                },
                             };
                             break :blk err;
                         } else {
@@ -1314,7 +1350,7 @@ pub const IO = struct {
             }.wrapper,
             .operation = .{
                 .timeout = .{
-                    .timespec = .{ .tv_sec = 0, .tv_nsec = nanoseconds },
+                    .timespec = .{ .sec = 0, .nsec = nanoseconds },
                 },
             },
         };
