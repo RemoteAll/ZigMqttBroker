@@ -19,7 +19,7 @@ pub const IO = struct {
     timeouts: FIFOType(Completion) = .{ .name = "io_timeouts" },
     completed: FIFOType(Completion) = .{ .name = "io_completed" },
 
-    pub fn init(entries: u12, flags: u32) !IO {
+    pub fn init(entries: u16, flags: u32) !IO {
         _ = entries;
         _ = flags;
 

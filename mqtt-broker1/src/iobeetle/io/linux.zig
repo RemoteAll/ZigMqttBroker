@@ -57,7 +57,7 @@ pub const IO = struct {
         done,
     } = .inactive,
 
-    pub fn init(entries: u12, flags: u32) !IO {
+    pub fn init(entries: u16, flags: u32) !IO {
         // Detect the linux version to ensure that we support all io_uring ops used.
         const uts = posix.uname();
         const version = try parse_dirty_semver(&uts.release);

@@ -21,7 +21,7 @@ pub const IO = struct {
     completed: FIFOType(Completion) = .{ .name = "io_completed" },
     io_pending: FIFOType(Completion) = .{ .name = "io_pending" },
 
-    pub fn init(entries: u12, flags: u32) !IO {
+    pub fn init(entries: u16, flags: u32) !IO {
         _ = entries;
         _ = flags;
 
