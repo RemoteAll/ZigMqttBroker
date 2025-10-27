@@ -56,6 +56,11 @@ const ClientConnection = struct {
     reader: packet.Reader,
     writer: *packet.Writer,
 
+    // 发送缓冲区 - 用于异步发送
+    send_buffer: []u8,
+    send_len: usize = 0,
+    is_sending: bool = false,
+
     // Arena分配器用于此连接的所有内存分配
     arena: *ArenaAllocator,
 
@@ -83,6 +88,7 @@ const ClientConnection = struct {
         const client = try Client.init(arena_allocator, id, mqtt.ProtocolVersion.Invalid, dummy_stream, dummy_address);
 
         const read_buffer = try arena_allocator.alloc(u8, config.READ_BUFFER_SIZE);
+        const send_buffer = try arena_allocator.alloc(u8, config.WRITE_BUFFER_SIZE);
 
         const writer = try packet.Writer.init(arena_allocator);
 
@@ -95,6 +101,9 @@ const ClientConnection = struct {
             .read_buffer = read_buffer,
             .reader = packet.Reader.init(read_buffer),
             .writer = writer,
+            .send_buffer = send_buffer,
+            .send_len = 0,
+            .is_sending = false,
             .arena = arena,
             .is_disconnecting = false,
         };
@@ -262,6 +271,94 @@ const ClientConnection = struct {
         self.startRead(self.broker.io);
     }
 
+    /// 异步发送数据 - 核心方法
+    /// 将 writer 中的数据复制到 send_buffer 并提交异步发送请求
+    pub fn sendAsync(self: *ClientConnection) !void {
+        if (self.is_disconnecting) {
+            logger.debug("Client {} send skipped (disconnecting)", .{self.id});
+            return;
+        }
+
+        if (self.is_sending) {
+            logger.warn("Client {} send skipped (already sending)", .{self.id});
+            return error.SendInProgress;
+        }
+
+        const data_len = self.writer.getWrittenLength();
+        if (data_len == 0) {
+            logger.warn("Client {} send skipped (no data)", .{self.id});
+            return;
+        }
+
+        if (data_len > self.send_buffer.len) {
+            logger.err("Client {} send buffer overflow: {} > {}", .{ self.id, data_len, self.send_buffer.len });
+            return error.SendBufferOverflow;
+        }
+
+        // 复制数据到发送缓冲区
+        @memcpy(self.send_buffer[0..data_len], self.writer.buffer[0..data_len]);
+        self.send_len = data_len;
+        self.is_sending = true;
+
+        // 提交异步发送请求
+        self.state = .Writing;
+        self.broker.io.send(
+            *ClientConnection,
+            self,
+            onSendComplete,
+            &self.send_completion,
+            self.socket,
+            self.send_buffer[0..data_len],
+        );
+    }
+
+    /// send 完成回调
+    fn onSendComplete(
+        self: *ClientConnection,
+        completion: *IO.Completion,
+        result: IO.SendError!usize,
+    ) void {
+        _ = completion;
+
+        self.is_sending = false;
+
+        if (self.is_disconnecting) {
+            logger.debug("Client {} send callback ignored (disconnecting)", .{self.id});
+            return;
+        }
+
+        const sent = result catch |err| {
+            logger.err("Client {} send failed: {any}", .{ self.id, err });
+            self.broker.metrics.incNetworkError();
+            const need_cleanup = self.disconnect() catch |disconnect_err| {
+                std.log.err("Failed to disconnect client after send error: {any}", .{disconnect_err});
+                return;
+            };
+            if (need_cleanup) {
+                self.deinit(self.broker.allocator);
+            }
+            return;
+        };
+
+        if (sent != self.send_len) {
+            logger.err("Client {} partial send: {}/{} bytes", .{ self.id, sent, self.send_len });
+            // TODO: 处理部分发送的情况
+            self.broker.metrics.incNetworkError();
+            return;
+        }
+
+        logger.debug("Client {} sent {} bytes successfully", .{ self.id, sent });
+        self.broker.metrics.incMessageSent(sent);
+
+        // 清空 writer 准备下次使用
+        self.writer.reset();
+
+        // 继续处理(如果有待处理的数据)
+        if (self.state == .Writing) {
+            self.state = .Reading;
+        }
+    }
+
     /// 处理接收到的 MQTT 包
     /// 返回值：true = self 已被清理（不要再访问），false = self 仍然有效
     fn processPackets(self: *ClientConnection) !bool {
@@ -370,9 +467,10 @@ const ClientConnection = struct {
                 else => mqtt.ReasonCode.MalformedPacket,
             };
 
-            // 发送 CONNACK 拒绝
-            try connect.connack(self.writer, &self.client.stream, reason_code, false);
-            self.broker.metrics.incMessageSent(4); // CONNACK 固定4字节(包含字节统计)
+            // 发送 CONNACK 拒绝(使用异步版本)
+            self.writer.reset();
+            try connect.connackAsync(self.writer, false, reason_code);
+            try self.sendAsync();
             logger.warn("Client {d} connection rejected: {any}", .{ self.id, reason_code });
 
             // 抛出错误让调用者处理断开（不在这里 deinit）
@@ -453,11 +551,12 @@ const ClientConnection = struct {
         const session_present = if (connect_packet.connect_flags.clean_session)
             false // Clean Session = 1 时必须返回 false
         else
-            (has_existing_session or has_persisted_subscriptions); // Clean Session = 0 时，如果有旧会话或持久化订阅则返回 true
+            (has_existing_session or has_persisted_subscriptions); // Clean Session = 0 时,如果有旧会话或持久化订阅则返回 true
 
-        // 发送 CONNACK
-        try connect.connack(self.writer, &self.client.stream, reason_code, session_present);
-        self.broker.metrics.incMessageSent(4); // CONNACK 固定4字节(包含字节统计)
+        // 发送 CONNACK (使用异步版本)
+        self.writer.reset();
+        try connect.connackAsync(self.writer, session_present, reason_code);
+        try self.sendAsync();
 
         // 根据 Clean Session 标志判断连接类型
         const connection_type = if (connect_packet.connect_flags.clean_session)
@@ -494,10 +593,10 @@ const ClientConnection = struct {
             logger.info("Client {d} ({s}) subscribed to: {s}", .{ self.id, self.client.identifer, topic.filter });
         }
 
-        try subscribe.suback(self.writer, &self.client.stream, subscribe_packet.packet_id, self.client);
-        // SUBACK: 固定头(2) + 包ID(2) + 返回码(topics数量)
-        const suback_size = 2 + 2 + subscribe_packet.topics.items.len;
-        self.broker.metrics.incMessageSent(suback_size); // 包含字节统计
+        // 发送 SUBACK (使用异步版本)
+        self.writer.reset();
+        try subscribe.subackAsync(self.writer, subscribe_packet.packet_id, self.client);
+        try self.sendAsync();
     }
 
     fn handlePublish(self: *ClientConnection) !void {
@@ -513,19 +612,19 @@ const ClientConnection = struct {
             publish_packet.payload.len,
         });
 
-        // 根据 QoS 发送确认
+        // 根据 QoS 发送确认 (使用异步版本)
         switch (publish_packet.qos) {
             .AtMostOnce => {},
             .AtLeastOnce => {
                 if (publish_packet.packet_id) |pid| {
-                    try publish.sendPuback(self.writer, self.client, pid);
-                    self.broker.metrics.incMessageSent(4); // PUBACK 固定4字节(包含字节统计)
+                    try publish.sendPubackAsync(self.writer, pid);
+                    try self.sendAsync();
                 }
             },
             .ExactlyOnce => {
                 if (publish_packet.packet_id) |pid| {
-                    try publish.sendPubrec(self.writer, self.client, pid);
-                    self.broker.metrics.incMessageSent(4); // PUBREC 固定4字节(包含字节统计)
+                    try publish.sendPubrecAsync(self.writer, pid);
+                    try self.sendAsync();
                 }
             },
         }
@@ -565,7 +664,10 @@ const ClientConnection = struct {
             logger.info("Client {d} ({s}) unsubscribed from: {s}", .{ self.id, self.client.identifer, topic_filter });
         }
 
-        try unsubscribe.unsuback(self.writer, &self.client.stream, unsubscribe_packet.packet_id);
+        // 发送 UNSUBACK (使用异步版本)
+        self.writer.reset();
+        try unsubscribe.unsubackAsync(self.writer, unsubscribe_packet.packet_id);
+        try self.sendAsync();
     }
 
     fn handlePingreq(self: *ClientConnection) !void {
@@ -574,12 +676,13 @@ const ClientConnection = struct {
         try self.writer.writeByte(0xD0); // PINGRESP 包类型
         try self.writer.writeByte(0); // Remaining length = 0
 
-        self.writer.writeToStream(&self.client.stream) catch |err| {
-            std.log.err("❌ CRITICAL: Failed to write PINGRESP to stream: {any}", .{err});
+        // 使用异步发送
+        self.sendAsync() catch |err| {
+            std.log.err("❌ CRITICAL: Failed to send PINGRESP: {any}", .{err});
             std.log.err("   Client {} will timeout and reconnect!", .{self.id});
-            return error.StreamWriteError;
+            return error.SendAsyncFailed;
         };
-        logger.info("✅ PINGRESP sent successfully to client {}", .{self.id});
+        logger.info("✅ PINGRESP queued for async send to client {}", .{self.id});
     }
 
     /// 处理 PUBACK (QoS 1 发布确认)
@@ -603,10 +706,7 @@ const ClientConnection = struct {
         try self.writer.writeByte(0x62); // PUBREL 包类型 (0110 0010)
         try self.writer.writeByte(2); // Remaining length = 2 (packet_id)
         try self.writer.writeTwoBytes(packet_id);
-        try self.writer.writeToStream(&self.client.stream);
-
-        // 记录发送的 PUBREL 消息
-        self.broker.metrics.incMessageSent(4);
+        try self.sendAsync();
 
         logger.debug("Client {d} sent PUBREL for packet {d}", .{ self.id, packet_id });
     }
@@ -622,10 +722,7 @@ const ClientConnection = struct {
         try self.writer.writeByte(0x70); // PUBCOMP 包类型 (0111 0000)
         try self.writer.writeByte(2); // Remaining length = 2 (packet_id)
         try self.writer.writeTwoBytes(packet_id);
-        try self.writer.writeToStream(&self.client.stream);
-
-        // 记录发送的 PUBCOMP 消息
-        self.broker.metrics.incMessageSent(4);
+        try self.sendAsync();
 
         logger.debug("Client {d} sent PUBCOMP for packet {d}", .{ self.id, packet_id });
 
@@ -665,6 +762,9 @@ const ClientConnection = struct {
         );
 
         const bytes_sent = subscriber_conn.writer.pos;
+
+        // TODO: 转发消息也应改为异步
+        // 当前暂时保留同步方式,避免与当前连接的发送缓冲区冲突
         try subscriber_conn.writer.writeToStream(&subscriber.stream);
 
         // 记录转发指标

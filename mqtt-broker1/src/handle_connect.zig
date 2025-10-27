@@ -296,6 +296,27 @@ pub fn connack(writer: *packet.Writer, stream: *net.Stream, reason_code: mqtt.Re
     std.debug.print("----------------\n", .{});
 }
 
+/// 异步版本的 connack - 只准备数据,不直接发送
+pub fn connackAsync(writer: *packet.Writer, session_present: bool, reason_code: mqtt.ReasonCode) !void {
+    std.debug.print("--- CONNACK packet ---\n", .{});
+
+    try writer.startPacket(mqtt.Command.CONNACK);
+
+    // Connect Acknowledge Flags
+    const session_present_byte: u8 = if (session_present) 1 else 0;
+    try writer.writeByte(session_present_byte);
+    std.debug.print("Connection acknowledge: {} (session_present={})\n", .{ session_present_byte, session_present });
+
+    // connection return / reason code
+    try writer.writeByte(@intFromEnum(reason_code));
+    var buffer: [1024]u8 = undefined;
+    std.debug.print("Reason Code: {s}\n", .{try reason_code.longDescription(&buffer)});
+
+    try writer.finishPacket();
+
+    std.debug.print("----------------\n", .{});
+}
+
 pub fn disconnect(writer: *packet.Writer, stream: *net.Stream, reason_code: mqtt.ReasonCode) (packet.PacketWriterError || ConnectError || posix.WriteError)!void {
     try writer.startPacket(mqtt.Command.DISCONNECT);
 

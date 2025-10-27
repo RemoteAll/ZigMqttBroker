@@ -83,3 +83,15 @@ pub fn unsuback(writer: *packet.Writer, stream: *net.Stream, packet_id: u16) (pa
         return error.StreamWriteError;
     };
 }
+
+/// 异步版本: 发送 UNSUBACK 响应 - 只准备数据不发送
+pub fn unsubackAsync(writer: *packet.Writer, packet_id: u16) !void {
+    std.debug.print("Preparing UNSUBACK with packet_id {d}\n", .{packet_id});
+
+    try writer.startPacket(mqtt.Command.UNSUBACK);
+
+    // Variable Header: Packet Identifier
+    try writer.writeTwoBytes(packet_id);
+
+    try writer.finishPacket();
+}
