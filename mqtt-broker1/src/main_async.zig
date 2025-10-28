@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const config = @import("config.zig");
 const packet = @import("packet.zig");
 const mqtt = @import("mqtt.zig");
@@ -164,20 +163,19 @@ const ClientConnection = struct {
         }
 
         const length = result catch |err| {
-            // 区分不同类型的错误 - 使用条件编译处理平台特定错误
-            const is_windows = builtin.os.tag == .windows;
-
-            // Windows 特定：检查是否为 OperationCancelled（仅在 Windows 上）
-            if (is_windows and err == error.OperationCancelled) {
-                // CancelIoEx 取消的操作 - 这是我们主动调用的，完全正常
-                logger.debug("Client {d} recv operation cancelled (normal disconnect)", .{self.id});
-            } else switch (err) {
-                // 跨平台通用错误处理
+            // 区分不同类型的错误
+            switch (err) {
+                // 正常的断开/取消操作 - 使用 DEBUG 级别
+                error.OperationCancelled => {
+                    // CancelIoEx 取消的操作 - 这是我们主动调用的，完全正常
+                    logger.debug("Client {d} recv operation cancelled (normal disconnect)", .{self.id});
+                },
                 error.SocketNotConnected => {
+                    // Socket 已关闭或未连接 - 断开流程中的正常情况
                     logger.debug("Client {d} recv error (socket not connected)", .{self.id});
                 },
                 error.Unexpected => {
-                    // Socket 关闭导致的其他错误
+                    // Windows socket 关闭导致的其他错误
                     logger.debug("Client {d} recv error (unexpected): {any}", .{ self.id, err });
                 },
                 error.ConnectionResetByPeer => {
