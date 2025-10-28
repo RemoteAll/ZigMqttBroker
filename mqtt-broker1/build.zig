@@ -47,6 +47,14 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // 如果目标是 musl，使用静态链接
+    const is_musl = if (target.query.abi) |abi|
+        abi == .musl or abi == .musleabi or abi == .musleabihf
+    else
+        false;
+    if (is_musl) {
+        exe_async.linkage = .static;
+    }
 
     // 同步版本（保留用于对比测试）
     const exe_sync = b.addExecutable(.{
@@ -57,6 +65,9 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    if (is_musl) {
+        exe_sync.linkage = .static;
+    }
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
@@ -67,16 +78,13 @@ pub fn build(b: *std.Build) void {
     // 添加交叉编译目标（针对不同平台和架构）
     const cross_targets = [_]std.Target.Query{
         // Linux ARMv7 (32位) - 适用于树莓派等设备
+        // 修复：使用 baseline CPU 特性，避免 illegal instruction
         .{
             .cpu_arch = .arm,
             .os_tag = .linux,
             .abi = .gnueabihf,
-            .cpu_model = .{ .explicit = &std.Target.arm.cpu.generic },
-            .cpu_features_add = std.Target.arm.featureSet(&.{
-                .v7a,
-                .vfp3,
-                .neon,
-            }),
+            // 不指定 cpu_model，让 Zig 自动选择兼容的基线
+            // 不手动添加 CPU 特性，避免指令集不兼容
         },
         // Linux ARM64
         .{

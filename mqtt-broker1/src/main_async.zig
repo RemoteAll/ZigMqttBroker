@@ -1519,9 +1519,16 @@ pub const MqttBroker = struct {
 };
 
 pub fn main() !void {
+    // 第一行输出：确认程序启动
+    std.debug.print("=== MQTT Broker Starting ===\n", .{});
+    std.debug.print("Platform: {s}\n", .{@tagName(@import("builtin").os.tag)});
+    std.debug.print("CPU: {s}\n", .{@tagName(@import("builtin").cpu.arch)});
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    std.debug.print("Memory allocator initialized\n", .{});
 
     // 设置日志级别（根据配置）
     logger.setLevel(switch (config.DEFAULT_LOG_LEVEL) {
@@ -1531,8 +1538,18 @@ pub fn main() !void {
         .err => .err,
     });
 
-    const broker = try MqttBroker.init(allocator);
+    std.debug.print("Logger initialized\n", .{});
+
+    const broker = MqttBroker.init(allocator) catch |err| {
+        std.debug.print("FATAL: Failed to initialize broker: {any}\n", .{err});
+        return err;
+    };
     defer broker.deinit();
 
-    try broker.start(1883);
+    std.debug.print("Broker initialized, starting server...\n", .{});
+
+    broker.start(1883) catch |err| {
+        std.debug.print("FATAL: Failed to start broker: {any}\n", .{err});
+        return err;
+    };
 }
