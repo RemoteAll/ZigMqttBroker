@@ -1,0 +1,7 @@
+{
+  "port": 1883,
+  "log": {
+    "enabled": true,
+    "level": "warn"
+  }
+}

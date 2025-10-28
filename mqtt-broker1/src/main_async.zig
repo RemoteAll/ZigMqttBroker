@@ -1548,13 +1548,27 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // 设置日志级别（根据配置）
-    logger.setLevel(switch (config.DEFAULT_LOG_LEVEL) {
-        .debug => .debug,
-        .info => .info,
-        .warn => .warn,
-        .err => .err,
-    });
+    // 切换到可执行文件所在目录（确保相对路径 data/ 正确）
+    // 这样无论从哪里启动，都能找到 data/config.json 和 data/subscriptions.json
+    if (std.fs.selfExeDirPathAlloc(allocator)) |exe_dir_path| {
+        defer allocator.free(exe_dir_path);
+        std.posix.chdir(exe_dir_path) catch |err| {
+            logger.warn("Failed to change to exe directory '{s}': {any}", .{ exe_dir_path, err });
+        };
+    } else |err| {
+        logger.warn("Failed to get exe directory: {any}", .{err});
+    }
+
+    // 加载运行时配置（从 data/config.json）
+    const runtime_config = config.loadRuntimeConfig(allocator, "data/config.json");
+
+    // 设置日志级别（优先使用运行时配置）
+    if (runtime_config.log_enabled) {
+        logger.setLevel(runtime_config.log_level);
+    } else {
+        // 日志禁用时设置为最高级别，只保留 logger.always 的输出
+        logger.setLevel(.err);
+    }
 
     logger.always("=== MQTT Broker Starting (Async) ===", .{});
     logger.always("Build mode: {s}", .{@tagName(@import("builtin").mode)});
@@ -1575,7 +1589,8 @@ pub fn main() !void {
 
     logger.always("Starting MQTT broker server", .{});
 
-    broker.start(1883) catch |err| {
+    // 使用运行时配置的端口
+    broker.start(runtime_config.port) catch |err| {
         logger.err("Failed to start broker: {any}", .{err});
         return err;
     };

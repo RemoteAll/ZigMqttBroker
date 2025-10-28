@@ -3,6 +3,144 @@ const builtin = @import("builtin");
 const logger = @import("logger.zig");
 
 // ========================================================================
+// 运行时配置结构（从 data/config.json 加载）
+// ========================================================================
+
+/// 运行时可配置项（优先级高于编译期默认值）
+pub const RuntimeConfig = struct {
+    port: u16 = PORT,
+    log_enabled: bool = true,
+    log_level: logger.Level = DEFAULT_LOG_LEVEL,
+};
+
+/// 从 JSON 字符串解析日志级别
+fn parseLevelFromString(s: []const u8) ?logger.Level {
+    // 简单的字符串比较，不区分大小写
+    if (std.ascii.eqlIgnoreCase(s, "debug")) return .debug;
+    if (std.ascii.eqlIgnoreCase(s, "info")) return .info;
+    if (std.ascii.eqlIgnoreCase(s, "warn")) return .warn;
+    if (std.ascii.eqlIgnoreCase(s, "error") or std.ascii.eqlIgnoreCase(s, "err")) return .err;
+    return null;
+}
+
+/// 日志级别转字符串
+fn levelToString(l: logger.Level) []const u8 {
+    return switch (l) {
+        .debug => "debug",
+        .info => "info",
+        .warn => "warn",
+        .err => "error",
+    };
+}
+
+/// 加载运行时配置（从 data/config.json）
+/// 文件不存在时自动创建默认配置；解析失败时使用编译期默认值
+pub fn loadRuntimeConfig(allocator: std.mem.Allocator, path: []const u8) RuntimeConfig {
+    // 1. 确保目录存在
+    if (std.fs.path.dirname(path)) |dir| {
+        std.fs.cwd().makePath(dir) catch |err| {
+            logger.warn("Failed to ensure config directory '{s}': {any}, using compile-time defaults", .{ dir, err });
+            return RuntimeConfig{};
+        };
+    }
+
+    // 2. 尝试打开配置文件
+    const file = std.fs.cwd().openFile(path, .{ .mode = .read_only }) catch |err| {
+        if (err == error.FileNotFound) {
+            // 文件不存在，创建默认配置
+            const default_config = RuntimeConfig{};
+            saveRuntimeConfig(allocator, path, default_config) catch |save_err| {
+                logger.warn("Failed to write default config to '{s}': {any}", .{ path, save_err });
+            };
+            logger.always("Created default configuration at '{s}'", .{path});
+            return default_config;
+        } else {
+            logger.warn("Failed to open config file '{s}': {any}, using defaults", .{ path, err });
+            return RuntimeConfig{};
+        }
+    };
+    defer file.close();
+
+    // 3. 读取文件内容
+    const content = file.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+        logger.warn("Failed to read config file '{s}': {any}, using defaults", .{ path, err });
+        return RuntimeConfig{};
+    };
+    defer allocator.free(content);
+
+    // 4. 解析 JSON
+    const parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        content,
+        .{},
+    ) catch |err| {
+        logger.warn("Invalid JSON in config file '{s}': {any}, using defaults", .{ path, err });
+        return RuntimeConfig{};
+    };
+    defer parsed.deinit();
+
+    // 5. 提取配置项
+    var rc = RuntimeConfig{};
+    const root = parsed.value;
+
+    if (root == .object) {
+        const obj = root.object;
+
+        // 解析 port
+        if (obj.get("port")) |port_value| {
+            if (port_value == .integer) {
+                const p = @as(u16, @intCast(port_value.integer));
+                if (p != 0) rc.port = p;
+            }
+        }
+
+        // 解析 log 配置
+        if (obj.get("log")) |log_value| {
+            if (log_value == .object) {
+                const log_obj = log_value.object;
+
+                if (log_obj.get("enabled")) |enabled_value| {
+                    if (enabled_value == .bool) {
+                        rc.log_enabled = enabled_value.bool;
+                    }
+                }
+
+                if (log_obj.get("level")) |level_value| {
+                    if (level_value == .string) {
+                        if (parseLevelFromString(level_value.string)) |lvl| {
+                            rc.log_level = lvl;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    logger.info("Loaded configuration from '{s}' (port={d}, log_level={s})", .{ path, rc.port, @tagName(rc.log_level) });
+    return rc;
+}
+
+/// 保存运行时配置到 JSON 文件
+fn saveRuntimeConfig(allocator: std.mem.Allocator, path: []const u8, rc: RuntimeConfig) !void {
+    var json_buf: std.ArrayList(u8) = .{};
+    defer json_buf.deinit(allocator);
+
+    // 手动构建 JSON（与 persistence.zig 风格一致）
+    try json_buf.appendSlice(allocator, "{\n");
+    try std.fmt.format(json_buf.writer(allocator), "  \"port\": {d},\n", .{rc.port});
+    try json_buf.appendSlice(allocator, "  \"log\": {\n");
+    try std.fmt.format(json_buf.writer(allocator), "    \"enabled\": {s},\n", .{if (rc.log_enabled) "true" else "false"});
+    try std.fmt.format(json_buf.writer(allocator), "    \"level\": \"{s}\"\n", .{levelToString(rc.log_level)});
+    try json_buf.appendSlice(allocator, "  }\n");
+    try json_buf.appendSlice(allocator, "}\n");
+
+    const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
+    defer file.close();
+    try file.writeAll(json_buf.items);
+}
+
+// ========================================================================
 // 平台检测与性能分级
 // ========================================================================
 
