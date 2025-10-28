@@ -122,10 +122,9 @@ pub const IO = struct {
         const current_ts = posix.clock_gettime(posix.CLOCK.MONOTONIC) catch unreachable;
         // The absolute CLOCK_MONOTONIC time after which we may return from this function:
         // 注意：Zig 0.15.2+ 中 timespec 和 kernel_timespec 都使用 sec/nsec 字段
-        // 需要将 nsec (isize) 和 nanoseconds (u63) 转换为兼容的类型
         const timeout_ts: os.linux.kernel_timespec = .{
             .sec = @intCast(current_ts.sec),
-            .nsec = @intCast(@as(i64, @intCast(current_ts.nsec)) + @as(i64, @intCast(nanoseconds))),
+            .nsec = @intCast(current_ts.nsec + nanoseconds),
         };
         var timeouts: usize = 0;
         var etime = false;
@@ -228,9 +227,7 @@ pub const IO = struct {
                     if (-cqe.res == @intFromEnum(posix.E.TIME)) etime.* = true;
                     continue;
                 }
-                // 在32位平台上,user_data的高32位会被截断,这在大多数情况下是安全的
-                // 因为32位系统的地址空间本身就只有32位
-                const completion: *Completion = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
+                const completion: *Completion = @ptrFromInt(cqe.user_data);
                 completion.result = cqe.res;
                 // We do not run the completion here (instead appending to a linked list) to avoid:
                 // * recursion through `flush_submissions()` and `flush_completions()`,

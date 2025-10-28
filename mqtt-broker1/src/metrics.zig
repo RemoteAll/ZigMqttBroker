@@ -1,62 +1,55 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const logger = @import("logger.zig");
 
-// 根据目标架构选择合适的原子计数器类型
-// 32位架构(如ARMv7)不支持64位原子操作,使用u32
-// 64位架构使用u64以支持更大的计数范围
-const CounterType = if (@sizeOf(usize) >= 8) u64 else u32;
-
 /// 原子指标结构体 - 支持多线程安全更新
-/// 在32位平台上使用u32计数器,64位平台使用u64计数器
 pub const Metrics = struct {
     // 连接统计
-    connections_current: std.atomic.Value(CounterType), // 当前连接数
-    connections_total: std.atomic.Value(CounterType), // 累计连接数
-    connections_refused: std.atomic.Value(CounterType), // 拒绝连接数
+    connections_current: std.atomic.Value(u64), // 当前连接数
+    connections_total: std.atomic.Value(u64), // 累计连接数
+    connections_refused: std.atomic.Value(u64), // 拒绝连接数
 
     // 消息统计
-    messages_received: std.atomic.Value(CounterType), // 接收消息数
-    messages_sent: std.atomic.Value(CounterType), // 发送消息数
-    messages_dropped: std.atomic.Value(CounterType), // 丢弃消息数
+    messages_received: std.atomic.Value(u64), // 接收消息数
+    messages_sent: std.atomic.Value(u64), // 发送消息数
+    messages_dropped: std.atomic.Value(u64), // 丢弃消息数
 
     // 字节统计
-    bytes_received: std.atomic.Value(CounterType), // 接收字节数
-    bytes_sent: std.atomic.Value(CounterType), // 发送字节数
+    bytes_received: std.atomic.Value(u64), // 接收字节数
+    bytes_sent: std.atomic.Value(u64), // 发送字节数
 
     // PUBLISH 统计
-    publish_received: std.atomic.Value(CounterType), // 接收 PUBLISH 数
-    publish_sent: std.atomic.Value(CounterType), // 发送 PUBLISH 数
+    publish_received: std.atomic.Value(u64), // 接收 PUBLISH 数
+    publish_sent: std.atomic.Value(u64), // 发送 PUBLISH 数
 
     // 订阅统计
-    subscriptions_current: std.atomic.Value(CounterType), // 当前订阅数
-    subscriptions_total: std.atomic.Value(CounterType), // 累计订阅数
+    subscriptions_current: std.atomic.Value(u64), // 当前订阅数
+    subscriptions_total: std.atomic.Value(u64), // 累计订阅数
 
     // 错误统计
-    errors_total: std.atomic.Value(CounterType), // 总错误数
-    errors_protocol: std.atomic.Value(CounterType), // 协议错误数
-    errors_network: std.atomic.Value(CounterType), // 网络错误数
+    errors_total: std.atomic.Value(u64), // 总错误数
+    errors_protocol: std.atomic.Value(u64), // 协议错误数
+    errors_network: std.atomic.Value(u64), // 网络错误数
 
     // 服务器信息
     start_time: i64, // 启动时间戳(毫秒)
 
     pub fn init() Metrics {
         return Metrics{
-            .connections_current = std.atomic.Value(CounterType).init(0),
-            .connections_total = std.atomic.Value(CounterType).init(0),
-            .connections_refused = std.atomic.Value(CounterType).init(0),
-            .messages_received = std.atomic.Value(CounterType).init(0),
-            .messages_sent = std.atomic.Value(CounterType).init(0),
-            .messages_dropped = std.atomic.Value(CounterType).init(0),
-            .bytes_received = std.atomic.Value(CounterType).init(0),
-            .bytes_sent = std.atomic.Value(CounterType).init(0),
-            .publish_received = std.atomic.Value(CounterType).init(0),
-            .publish_sent = std.atomic.Value(CounterType).init(0),
-            .subscriptions_current = std.atomic.Value(CounterType).init(0),
-            .subscriptions_total = std.atomic.Value(CounterType).init(0),
-            .errors_total = std.atomic.Value(CounterType).init(0),
-            .errors_protocol = std.atomic.Value(CounterType).init(0),
-            .errors_network = std.atomic.Value(CounterType).init(0),
+            .connections_current = std.atomic.Value(u64).init(0),
+            .connections_total = std.atomic.Value(u64).init(0),
+            .connections_refused = std.atomic.Value(u64).init(0),
+            .messages_received = std.atomic.Value(u64).init(0),
+            .messages_sent = std.atomic.Value(u64).init(0),
+            .messages_dropped = std.atomic.Value(u64).init(0),
+            .bytes_received = std.atomic.Value(u64).init(0),
+            .bytes_sent = std.atomic.Value(u64).init(0),
+            .publish_received = std.atomic.Value(u64).init(0),
+            .publish_sent = std.atomic.Value(u64).init(0),
+            .subscriptions_current = std.atomic.Value(u64).init(0),
+            .subscriptions_total = std.atomic.Value(u64).init(0),
+            .errors_total = std.atomic.Value(u64).init(0),
+            .errors_protocol = std.atomic.Value(u64).init(0),
+            .errors_network = std.atomic.Value(u64).init(0),
             .start_time = std.time.milliTimestamp(),
         };
     }
