@@ -19,16 +19,11 @@ pub fn build(b: *std.Build) void {
             .cpu_model = .{ .explicit = &std.Target.arm.cpu.arm1176jzf_s },
         });
     } else if (std.mem.eql(u8, arm_version, "v7")) {
-        // 针对不支持 NEON 的 ARMv7 设备（如 Cortex-A9）
-        // 使用软浮点 ABI 和通用 ARMv7 特性集
         target = b.resolveTargetQuery(.{
             .cpu_arch = .arm,
             .os_tag = .linux,
-            .abi = .musleabi, // 改用软浮点 ABI，兼容性更好
-            .cpu_model = .{ .explicit = &std.Target.arm.cpu.generic },
-            .cpu_features_add = std.Target.arm.featureSet(&.{
-                .v7a, // ARMv7-A 基础架构
-            }),
+            .abi = .musleabihf,
+            .cpu_model = .{ .explicit = &std.Target.arm.cpu.cortex_a8 },
         });
     } else {
         // 默认：标准 target 选项
