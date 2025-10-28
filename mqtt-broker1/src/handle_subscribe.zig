@@ -102,7 +102,25 @@ pub fn suback(writer: *packet.Writer, stream: *net.Stream, packet_id: u16, clien
     try writer.finishPacket();
 
     writer.writeToStream(stream) catch |err| {
-        std.log.err("Failed to write SUBACK to stream: {any}", .{err});
+        std.log.err("❌ CRITICAL: Failed to write SUBACK to stream: {any}", .{err});
+        std.log.err("   This will cause client timeout and reconnection!", .{});
         return error.StreamWriteError;
     };
+
+    std.log.info("✅ SUBACK sent successfully to client {}", .{client.id});
+}
+
+/// 异步版本的 suback - 只准备数据,不直接发送
+pub fn subackAsync(writer: *packet.Writer, packet_id: u16, client: *Client) !void {
+    std.debug.print("Preparing SUBACK for client {}\n", .{client.id});
+
+    try writer.startPacket(mqtt.Command.SUBACK);
+
+    // variable header
+    try writer.writeTwoBytes(packet_id);
+
+    // return code
+    try writer.writeByte(@intFromEnum(SubackReturnCode.SuccessQos0));
+
+    try writer.finishPacket();
 }

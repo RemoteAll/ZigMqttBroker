@@ -130,6 +130,14 @@ pub fn sendPuback(writer: *packet.Writer, client: *Client, packet_id: u16) !void
     logger.debug("Server sent PUBACK to {s} (packet_id={d})", .{ client.identifer, packet_id });
 }
 
+/// 异步版本: 发送 PUBACK (QoS 1 确认) - 只准备数据不发送
+pub fn sendPubackAsync(writer: *packet.Writer, packet_id: u16) !void {
+    writer.reset();
+    try writer.startPacket(mqtt.Command.PUBACK);
+    try writer.writeTwoBytes(packet_id);
+    try writer.finishPacket();
+}
+
 /// 发送 PUBREC (QoS 2 第一步)
 pub fn sendPubrec(writer: *packet.Writer, client: *Client, packet_id: u16) !void {
     writer.reset();
@@ -138,6 +146,14 @@ pub fn sendPubrec(writer: *packet.Writer, client: *Client, packet_id: u16) !void
     try writer.finishPacket();
     try writer.writeToStream(&client.stream);
     logger.debug("Server sent PUBREC to {s} (packet_id={d})", .{ client.identifer, packet_id });
+}
+
+/// 异步版本: 发送 PUBREC (QoS 2 第一步) - 只准备数据不发送
+pub fn sendPubrecAsync(writer: *packet.Writer, packet_id: u16) !void {
+    writer.reset();
+    try writer.startPacket(mqtt.Command.PUBREC);
+    try writer.writeTwoBytes(packet_id);
+    try writer.finishPacket();
 }
 
 /// 发送 PUBCOMP (QoS 2 第三步)

@@ -10,10 +10,12 @@ pub fn DoublyLinkedListType(
     comptime field_back_enum: std.meta.FieldEnum(Node),
     comptime field_next_enum: std.meta.FieldEnum(Node),
 ) type {
-    assert(@typeInfo(Node) == .Struct);
+    // Zig 0.15.2 兼容性修复: @typeInfo 返回的类型标签名称从 .Struct 改为 .@"struct"
+    assert(@typeInfo(Node) == .@"struct");
     assert(field_back_enum != field_next_enum);
-    assert(std.meta.FieldType(Node, field_back_enum) == ?*Node);
-    assert(std.meta.FieldType(Node, field_next_enum) == ?*Node);
+    // Zig 0.15.2 兼容性修复: std.meta.FieldType 改为 std.meta.fieldInfo(...).type
+    assert(std.meta.fieldInfo(Node, field_back_enum).type == ?*Node);
+    assert(std.meta.fieldInfo(Node, field_next_enum).type == ?*Node);
 
     const field_back = @tagName(field_back_enum);
     const field_next = @tagName(field_next_enum);
@@ -156,4 +158,3 @@ test "DoublyLinkedList LIFO" {
     try std.testing.expectEqual(list.pop().?, &nodes[0]);
     try std.testing.expectEqual(list.pop(), null);
 }
-

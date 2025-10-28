@@ -56,11 +56,21 @@ const ClientConnection = struct {
     reader: packet.Reader,
     writer: *packet.Writer,
 
+    // 发送缓冲区 - 用于异步发送
+    send_buffer: []u8,
+    send_len: usize = 0,
+    is_sending: bool = false,
+
     // Arena分配器用于此连接的所有内存分配
     arena: *ArenaAllocator,
 
     // 防止重复断开连接
     is_disconnecting: bool = false,
+
+    /// ⚠️ 关键：保存此连接的 Clean Session 标志
+    /// 因为 Client 对象可能被多个连接共享，不能依赖 client.clean_start
+    /// 每个连接在断开时必须根据自己的 clean_session 标志来决定是否清理订阅
+    connection_clean_session: bool = false,
 
     pub fn init(
         base_allocator: Allocator,
@@ -83,6 +93,7 @@ const ClientConnection = struct {
         const client = try Client.init(arena_allocator, id, mqtt.ProtocolVersion.Invalid, dummy_stream, dummy_address);
 
         const read_buffer = try arena_allocator.alloc(u8, config.READ_BUFFER_SIZE);
+        const send_buffer = try arena_allocator.alloc(u8, config.WRITE_BUFFER_SIZE);
 
         const writer = try packet.Writer.init(arena_allocator);
 
@@ -95,8 +106,12 @@ const ClientConnection = struct {
             .read_buffer = read_buffer,
             .reader = packet.Reader.init(read_buffer),
             .writer = writer,
+            .send_buffer = send_buffer,
+            .send_len = 0,
+            .is_sending = false,
             .arena = arena,
             .is_disconnecting = false,
+            .connection_clean_session = false, // 初始化为 false，在 CONNECT 时设置
         };
 
         return self;
@@ -164,18 +179,24 @@ const ClientConnection = struct {
 
         const length = result catch |err| {
             // 区分不同类型的错误
-            switch (err) {
-                // 正常的断开/取消操作 - 使用 DEBUG 级别
-                error.OperationCancelled => {
-                    // CancelIoEx 取消的操作 - 这是我们主动调用的，完全正常
-                    logger.debug("Client {d} recv operation cancelled (normal disconnect)", .{self.id});
-                },
+            const is_windows = @import("builtin").os.tag == .windows;
+
+            // 使用 comptime 检查错误类型以支持跨平台编译
+            const is_operation_cancelled = if (is_windows)
+                err == error.OperationCancelled
+            else
+                false;
+
+            if (is_operation_cancelled) {
+                // Windows 特有: CancelIoEx 取消的操作 - 这是我们主动调用的，完全正常
+                logger.debug("Client {d} recv operation cancelled (normal disconnect)", .{self.id});
+            } else switch (err) {
                 error.SocketNotConnected => {
                     // Socket 已关闭或未连接 - 断开流程中的正常情况
                     logger.debug("Client {d} recv error (socket not connected)", .{self.id});
                 },
                 error.Unexpected => {
-                    // Windows socket 关闭导致的其他错误
+                    // Windows/Linux: socket 关闭导致的其他错误
                     logger.debug("Client {d} recv error (unexpected): {any}", .{ self.id, err });
                 },
                 error.ConnectionResetByPeer => {
@@ -254,6 +275,94 @@ const ClientConnection = struct {
 
         // 继续读取下一批数据
         self.startRead(self.broker.io);
+    }
+
+    /// 异步发送数据 - 核心方法
+    /// 将 writer 中的数据复制到 send_buffer 并提交异步发送请求
+    pub fn sendAsync(self: *ClientConnection) !void {
+        if (self.is_disconnecting) {
+            logger.debug("Client {} send skipped (disconnecting)", .{self.id});
+            return;
+        }
+
+        if (self.is_sending) {
+            logger.warn("Client {} send skipped (already sending)", .{self.id});
+            return error.SendInProgress;
+        }
+
+        const data_len = self.writer.getWrittenLength();
+        if (data_len == 0) {
+            logger.warn("Client {} send skipped (no data)", .{self.id});
+            return;
+        }
+
+        if (data_len > self.send_buffer.len) {
+            logger.err("Client {} send buffer overflow: {} > {}", .{ self.id, data_len, self.send_buffer.len });
+            return error.SendBufferOverflow;
+        }
+
+        // 复制数据到发送缓冲区
+        @memcpy(self.send_buffer[0..data_len], self.writer.buffer[0..data_len]);
+        self.send_len = data_len;
+        self.is_sending = true;
+
+        // 提交异步发送请求
+        self.state = .Writing;
+        self.broker.io.send(
+            *ClientConnection,
+            self,
+            onSendComplete,
+            &self.send_completion,
+            self.socket,
+            self.send_buffer[0..data_len],
+        );
+    }
+
+    /// send 完成回调
+    fn onSendComplete(
+        self: *ClientConnection,
+        completion: *IO.Completion,
+        result: IO.SendError!usize,
+    ) void {
+        _ = completion;
+
+        self.is_sending = false;
+
+        if (self.is_disconnecting) {
+            logger.debug("Client {} send callback ignored (disconnecting)", .{self.id});
+            return;
+        }
+
+        const sent = result catch |err| {
+            logger.err("Client {} send failed: {any}", .{ self.id, err });
+            self.broker.metrics.incNetworkError();
+            const need_cleanup = self.disconnect() catch |disconnect_err| {
+                std.log.err("Failed to disconnect client after send error: {any}", .{disconnect_err});
+                return;
+            };
+            if (need_cleanup) {
+                self.deinit(self.broker.allocator);
+            }
+            return;
+        };
+
+        if (sent != self.send_len) {
+            logger.err("Client {} partial send: {}/{} bytes", .{ self.id, sent, self.send_len });
+            // TODO: 处理部分发送的情况
+            self.broker.metrics.incNetworkError();
+            return;
+        }
+
+        logger.debug("Client {} sent {} bytes successfully", .{ self.id, sent });
+        self.broker.metrics.incMessageSent(sent);
+
+        // 清空 writer 准备下次使用
+        self.writer.reset();
+
+        // 继续处理(如果有待处理的数据)
+        if (self.state == .Writing) {
+            self.state = .Reading;
+        }
     }
 
     /// 处理接收到的 MQTT 包
@@ -364,9 +473,10 @@ const ClientConnection = struct {
                 else => mqtt.ReasonCode.MalformedPacket,
             };
 
-            // 发送 CONNACK 拒绝
-            try connect.connack(self.writer, &self.client.stream, reason_code, false);
-            self.broker.metrics.incMessageSent(4); // CONNACK 固定4字节(包含字节统计)
+            // 发送 CONNACK 拒绝(使用异步版本)
+            self.writer.reset();
+            try connect.connackAsync(self.writer, false, reason_code);
+            try self.sendAsync();
             logger.warn("Client {d} connection rejected: {any}", .{ self.id, reason_code });
 
             // 抛出错误让调用者处理断开（不在这里 deinit）
@@ -381,6 +491,9 @@ const ClientConnection = struct {
         self.client.protocol_version = mqtt.ProtocolVersion.fromU8(connect_packet.protocol_version);
         self.client.keep_alive = connect_packet.keep_alive;
         self.client.clean_start = connect_packet.connect_flags.clean_session;
+
+        // ⚠️ 关键：保存此连接的 Clean Session 标志（不依赖共享的 Client 对象）
+        self.connection_clean_session = connect_packet.connect_flags.clean_session;
 
         // 设置会话过期时间
         // MQTT 3.1.1: 使用服务器配置的默认值（协议本身不支持此字段）
@@ -417,6 +530,10 @@ const ClientConnection = struct {
             break :blk false;
         };
 
+        // 标记是否需要从持久化恢复订阅
+        // 只有在以下情况才需要恢复：没有活跃旧连接（新连接）但有持久化订阅
+        var needs_restore_from_persistence = false;
+
         if (self.broker.clients.get(mqtt_client_id)) |old_conn| {
             logger.info("Client {s} is reconnecting (old_conn #{d}), handling session...", .{ mqtt_client_id, old_conn.id });
 
@@ -426,16 +543,28 @@ const ClientConnection = struct {
                 logger.info("Clean Session = 1, clearing old subscriptions for {s}", .{mqtt_client_id});
                 self.broker.subscriptions.unsubscribeAll(old_conn.client);
             } else {
-                // Clean Session = 0: 保留订阅，但需要更新订阅树中的 Client 指针
-                // 这样订阅树中的指针指向新的 Client 对象
-                logger.info("Clean Session = 0, preserving subscriptions for {s}", .{mqtt_client_id});
-                // 订阅树中的 *Client 指针会在下面的 put 操作后自动指向新的 client
+                // Clean Session = 0: 复用旧连接的 Client 对象,保留订阅指针有效
+                logger.info("Clean Session = 0, reusing old Client object for {s}", .{mqtt_client_id});
+
+                // ⚠️ 关键修复：复用旧的 Client 对象,避免订阅树中的指针失效
+                // 旧的 client 指针已经在订阅树中被引用,必须保持其有效性
+                self.client = old_conn.client;
+                self.client.is_connected = true; // 恢复连接状态
+
+                // 重要：复用旧 Client 时，订阅已经在内存中，不需要从持久化恢复
+                needs_restore_from_persistence = false;
             }
 
             // 关闭旧连接的 socket 和网络资源
             self.broker.io.close_socket(old_conn.socket);
-            // 注意：不调用 old_conn.deinit()，因为订阅树可能还在引用 old_conn.client
-            // 而是让新连接复用旧会话的 Client 对象
+            // 注意：Clean Session = 0 时不释放 old_conn.client，因为我们复用了它
+        } else {
+            // 没有活跃的旧连接
+            if (!connect_packet.connect_flags.clean_session and has_persisted_subscriptions) {
+                // Clean Session = 0 且有持久化订阅，需要恢复
+                needs_restore_from_persistence = true;
+                logger.info("Client {s} is new connection with persisted subscriptions, will restore", .{mqtt_client_id});
+            }
         }
 
         // 将新连接注册到 broker（重连时会替换旧连接）
@@ -447,11 +576,12 @@ const ClientConnection = struct {
         const session_present = if (connect_packet.connect_flags.clean_session)
             false // Clean Session = 1 时必须返回 false
         else
-            (has_existing_session or has_persisted_subscriptions); // Clean Session = 0 时，如果有旧会话或持久化订阅则返回 true
+            (has_existing_session or has_persisted_subscriptions); // Clean Session = 0 时,如果有旧会话或持久化订阅则返回 true
 
-        // 发送 CONNACK
-        try connect.connack(self.writer, &self.client.stream, reason_code, session_present);
-        self.broker.metrics.incMessageSent(4); // CONNACK 固定4字节(包含字节统计)
+        // 发送 CONNACK (使用异步版本)
+        self.writer.reset();
+        try connect.connackAsync(self.writer, session_present, reason_code);
+        try self.sendAsync();
 
         // 根据 Clean Session 标志判断连接类型
         const connection_type = if (connect_packet.connect_flags.clean_session)
@@ -469,11 +599,15 @@ const ClientConnection = struct {
             session_present,
         });
 
-        // 如果 session_present = true，恢复持久化的订阅到主题树
-        if (session_present and !connect_packet.connect_flags.clean_session) {
+        // 只有在明确需要从持久化恢复时才调用 restoreClientSubscriptions
+        // 避免重复恢复（复用旧 Client 对象时订阅已经在内存中）
+        if (needs_restore_from_persistence) {
+            logger.info("Restoring subscriptions from persistence for client {s}", .{self.client.identifer});
             self.broker.subscriptions.restoreClientSubscriptions(self.client) catch |err| {
                 logger.err("Failed to restore subscriptions for client {s}: {any}", .{ self.client.identifer, err });
             };
+        } else if (has_existing_session and !connect_packet.connect_flags.clean_session) {
+            logger.info("Client {s} reused old Client object, subscriptions already in memory", .{self.client.identifer});
         }
     }
 
@@ -488,10 +622,10 @@ const ClientConnection = struct {
             logger.info("Client {d} ({s}) subscribed to: {s}", .{ self.id, self.client.identifer, topic.filter });
         }
 
-        try subscribe.suback(self.writer, &self.client.stream, subscribe_packet.packet_id, self.client);
-        // SUBACK: 固定头(2) + 包ID(2) + 返回码(topics数量)
-        const suback_size = 2 + 2 + subscribe_packet.topics.items.len;
-        self.broker.metrics.incMessageSent(suback_size); // 包含字节统计
+        // 发送 SUBACK (使用异步版本)
+        self.writer.reset();
+        try subscribe.subackAsync(self.writer, subscribe_packet.packet_id, self.client);
+        try self.sendAsync();
     }
 
     fn handlePublish(self: *ClientConnection) !void {
@@ -507,19 +641,19 @@ const ClientConnection = struct {
             publish_packet.payload.len,
         });
 
-        // 根据 QoS 发送确认
+        // 根据 QoS 发送确认 (使用异步版本)
         switch (publish_packet.qos) {
             .AtMostOnce => {},
             .AtLeastOnce => {
                 if (publish_packet.packet_id) |pid| {
-                    try publish.sendPuback(self.writer, self.client, pid);
-                    self.broker.metrics.incMessageSent(4); // PUBACK 固定4字节(包含字节统计)
+                    try publish.sendPubackAsync(self.writer, pid);
+                    try self.sendAsync();
                 }
             },
             .ExactlyOnce => {
                 if (publish_packet.packet_id) |pid| {
-                    try publish.sendPubrec(self.writer, self.client, pid);
-                    self.broker.metrics.incMessageSent(4); // PUBREC 固定4字节(包含字节统计)
+                    try publish.sendPubrecAsync(self.writer, pid);
+                    try self.sendAsync();
                 }
             },
         }
@@ -559,15 +693,25 @@ const ClientConnection = struct {
             logger.info("Client {d} ({s}) unsubscribed from: {s}", .{ self.id, self.client.identifer, topic_filter });
         }
 
-        try unsubscribe.unsuback(self.writer, &self.client.stream, unsubscribe_packet.packet_id);
+        // 发送 UNSUBACK (使用异步版本)
+        self.writer.reset();
+        try unsubscribe.unsubackAsync(self.writer, unsubscribe_packet.packet_id);
+        try self.sendAsync();
     }
 
     fn handlePingreq(self: *ClientConnection) !void {
+        logger.info("📡 Received PINGREQ from client {} ({s})", .{ self.id, self.client.identifer });
         self.writer.reset();
         try self.writer.writeByte(0xD0); // PINGRESP 包类型
         try self.writer.writeByte(0); // Remaining length = 0
-        try self.writer.writeToStream(&self.client.stream);
-        logger.debug("Client {d} PINGREQ -> PINGRESP", .{self.id});
+
+        // 使用异步发送
+        self.sendAsync() catch |err| {
+            std.log.err("❌ CRITICAL: Failed to send PINGRESP: {any}", .{err});
+            std.log.err("   Client {} will timeout and reconnect!", .{self.id});
+            return error.SendAsyncFailed;
+        };
+        logger.info("✅ PINGRESP queued for async send to client {}", .{self.id});
     }
 
     /// 处理 PUBACK (QoS 1 发布确认)
@@ -591,10 +735,7 @@ const ClientConnection = struct {
         try self.writer.writeByte(0x62); // PUBREL 包类型 (0110 0010)
         try self.writer.writeByte(2); // Remaining length = 2 (packet_id)
         try self.writer.writeTwoBytes(packet_id);
-        try self.writer.writeToStream(&self.client.stream);
-
-        // 记录发送的 PUBREL 消息
-        self.broker.metrics.incMessageSent(4);
+        try self.sendAsync();
 
         logger.debug("Client {d} sent PUBREL for packet {d}", .{ self.id, packet_id });
     }
@@ -610,10 +751,7 @@ const ClientConnection = struct {
         try self.writer.writeByte(0x70); // PUBCOMP 包类型 (0111 0000)
         try self.writer.writeByte(2); // Remaining length = 2 (packet_id)
         try self.writer.writeTwoBytes(packet_id);
-        try self.writer.writeToStream(&self.client.stream);
-
-        // 记录发送的 PUBCOMP 消息
-        self.broker.metrics.incMessageSent(4);
+        try self.sendAsync();
 
         logger.debug("Client {d} sent PUBCOMP for packet {d}", .{ self.id, packet_id });
 
@@ -630,7 +768,7 @@ const ClientConnection = struct {
         // TODO: 实现 pending_qos2_messages 映射
     }
 
-    /// 转发给单个订阅者
+    /// 转发给单个订阅者 - 异步版本
     fn forwardToSingle(self: *ClientConnection, subscriber: *Client, publish_packet: anytype) !void {
         if (!subscriber.is_connected) return;
 
@@ -640,7 +778,14 @@ const ClientConnection = struct {
             return;
         };
 
-        // 使用订阅者自己的 writer 来发送消息
+        // 检查订阅者是否正在发送(避免覆盖发送缓冲区)
+        if (subscriber_conn.is_sending) {
+            logger.warn("Subscriber {s} is busy sending, message dropped", .{subscriber.identifer});
+            self.broker.metrics.incMessageDropped();
+            return;
+        }
+
+        // 使用订阅者自己的 writer 来构建消息
         subscriber_conn.writer.reset();
         try publish.writePublish(
             subscriber_conn.writer,
@@ -652,25 +797,27 @@ const ClientConnection = struct {
             null,
         );
 
-        const bytes_sent = subscriber_conn.writer.pos;
-        try subscriber_conn.writer.writeToStream(&subscriber.stream);
+        // 异步发送
+        subscriber_conn.sendAsync() catch |err| {
+            logger.err("Failed to forward to {s}: {any}", .{ subscriber.identifer, err });
+            self.broker.metrics.incNetworkError();
+            return;
+        };
 
         // 记录转发指标
         self.broker.metrics.incPublishSent();
-        self.broker.metrics.incMessageSent(bytes_sent);
-
-        logger.debug("Forwarded to {s}", .{subscriber.identifer});
+        logger.debug("Forwarded to {s} (async)", .{subscriber.identifer});
     }
 
-    /// 顺序转发给多个订阅者（高性能版本：共享序列化结果）
+    /// 顺序转发给多个订阅者 - 异步版本(共享序列化结果)
     fn forwardSequentially(self: *ClientConnection, subscribers: []*Client, publish_packet: anytype) !void {
         // 性能优化：先构建一次 PUBLISH 包，然后共享给所有订阅者
-        // 对于大规模订阅（100万+设备），避免重复序列化
+        // 避免重复序列化,节省 CPU 和内存
 
-        // 1. 使用发布者的 writer 构建一次 PUBLISH 包
-        self.writer.reset();
+        // 1. 使用临时 arena 分配器构建一次 PUBLISH 包
+        var temp_writer = try packet.Writer.init(self.arena.allocator());
         try publish.writePublish(
-            self.writer,
+            temp_writer,
             publish_packet.topic,
             publish_packet.payload,
             .AtMostOnce,
@@ -679,12 +826,13 @@ const ClientConnection = struct {
             null,
         );
 
-        // 2. 获取序列化后的字节切片（零拷贝共享）
-        const serialized_message = self.writer.buffer[0..self.writer.pos];
+        // 2. 获取序列化后的字节切片（共享给所有订阅者）
+        const serialized_message = temp_writer.buffer[0..temp_writer.pos];
         const message_size = serialized_message.len;
 
-        // 3. 将预序列化的消息直接发送给所有订阅者
+        // 3. 异步发送给所有订阅者
         var sent_count: usize = 0;
+        var dropped_count: usize = 0;
         var error_count: usize = 0;
 
         for (subscribers) |subscriber| {
@@ -697,43 +845,58 @@ const ClientConnection = struct {
                 continue;
             };
 
-            // 直接写入预序列化的字节流（零拷贝）
-            subscriber_conn.client.stream.writeAll(serialized_message) catch |err| {
-                logger.err("Failed to forward to {s}: {any}", .{ subscriber.identifer, err });
-                self.broker.metrics.incNetworkError();
+            // 检查是否正在发送(避免覆盖发送缓冲区)
+            if (subscriber_conn.is_sending) {
+                logger.debug("Subscriber {s} busy, message dropped", .{subscriber.identifer});
+                dropped_count += 1;
+                self.broker.metrics.incMessageDropped();
+                continue;
+            }
+
+            // 检查缓冲区大小
+            if (message_size > subscriber_conn.send_buffer.len) {
+                logger.err("Message too large for {s}: {} > {}", .{ subscriber.identifer, message_size, subscriber_conn.send_buffer.len });
                 error_count += 1;
                 continue;
-            };
+            }
+
+            // 直接复制预序列化的消息到订阅者的发送缓冲区
+            @memcpy(subscriber_conn.send_buffer[0..message_size], serialized_message);
+            subscriber_conn.send_len = message_size;
+            subscriber_conn.is_sending = true;
+
+            // 提交异步发送请求
+            subscriber_conn.state = .Writing;
+            self.broker.io.send(
+                *ClientConnection,
+                subscriber_conn,
+                ClientConnection.onSendComplete,
+                &subscriber_conn.send_completion,
+                subscriber_conn.socket,
+                subscriber_conn.send_buffer[0..message_size],
+            );
 
             // 记录转发指标
             self.broker.metrics.incPublishSent();
-            self.broker.metrics.incMessageSent(message_size);
             sent_count += 1;
         }
 
-        // 批量日志记录（避免100万次日志调用）
+        // 批量日志记录（避免过多日志调用）
         if (sent_count > 10) {
-            logger.info("Forwarded to {d} subscribers ({d} errors)", .{ sent_count, error_count });
-        } else {
-            for (subscribers) |subscriber| {
-                if (subscriber.is_connected) {
-                    logger.debug("Forwarded to {s}", .{subscriber.identifer});
-                }
-            }
+            logger.info("Forwarded to {d} subscribers ({d} dropped, {d} errors)", .{ sent_count, dropped_count, error_count });
+        } else if (sent_count > 0) {
+            logger.debug("Forwarded to {d} subscribers", .{sent_count});
         }
     }
 
-    /// 批量 I/O 转发（优化版本：减少系统调用次数）
-    /// 性能提升：将订阅者分批处理，每批进行一次批量 I/O 操作
-    /// 适用场景：大量订阅者（config.BATCH_FORWARD_THRESHOLD+）时，显著减少内核态切换开销
+    /// 批量异步转发 - 高性能版本
+    /// 充分利用 io_uring 的批量提交能力
+    /// 适用场景：大量订阅者（config.BATCH_FORWARD_THRESHOLD+）
     fn forwardBatched(self: *ClientConnection, subscribers: []*Client, publish_packet: anytype) !void {
-        // 批量大小：从配置文件读取，允许运行时调优
-        const BATCH_SIZE = config.FORWARD_BATCH_SIZE;
-
         // 1. 序列化一次 PUBLISH 包（共享序列化结果）
-        self.writer.reset();
+        var temp_writer = try packet.Writer.init(self.arena.allocator());
         try publish.writePublish(
-            self.writer,
+            temp_writer,
             publish_packet.topic,
             publish_packet.payload,
             .AtMostOnce,
@@ -742,50 +905,64 @@ const ClientConnection = struct {
             null,
         );
 
-        const serialized_message = self.writer.buffer[0..self.writer.pos];
+        const serialized_message = temp_writer.buffer[0..temp_writer.pos];
         const message_size = serialized_message.len;
 
         var total_sent: usize = 0;
+        var total_dropped: usize = 0;
         var total_errors: usize = 0;
 
-        // 2. 分批处理订阅者
-        var batch_start: usize = 0;
-        while (batch_start < subscribers.len) {
-            const batch_end = @min(batch_start + BATCH_SIZE, subscribers.len);
-            const current_batch = subscribers[batch_start..batch_end];
+        // 2. 批量异步发送给所有订阅者
+        // io_uring 会自动批量提交,充分利用 SQ (Submission Queue) 的批处理能力
+        for (subscribers) |subscriber| {
+            if (!subscriber.is_connected) continue;
 
-            // 3. 批量发送当前批次
-            for (current_batch) |subscriber| {
-                if (!subscriber.is_connected) continue;
+            // 查找订阅者连接
+            const subscriber_conn = self.broker.clients.get(subscriber.identifer) orelse {
+                logger.warn("Subscriber {s} not found in broker clients map", .{subscriber.identifer});
+                total_errors += 1;
+                continue;
+            };
 
-                // 查找订阅者连接
-                const subscriber_conn = self.broker.clients.get(subscriber.identifer) orelse {
-                    logger.warn("Subscriber {s} not found in broker clients map", .{subscriber.identifer});
-                    total_errors += 1;
-                    continue;
-                };
-
-                // 批量写入（这里可以进一步优化为真正的 writev/scatter-gather I/O）
-                subscriber_conn.client.stream.writeAll(serialized_message) catch |err| {
-                    logger.err("Failed to forward to {s}: {any}", .{ subscriber.identifer, err });
-                    self.broker.metrics.incNetworkError();
-                    total_errors += 1;
-                    continue;
-                };
-
-                // 记录指标
-                self.broker.metrics.incPublishSent();
-                self.broker.metrics.incMessageSent(message_size);
-                total_sent += 1;
+            // 检查是否正在发送
+            if (subscriber_conn.is_sending) {
+                logger.debug("Subscriber {s} busy, message dropped", .{subscriber.identifer});
+                total_dropped += 1;
+                self.broker.metrics.incMessageDropped();
+                continue;
             }
 
-            batch_start = batch_end;
+            // 检查缓冲区大小
+            if (message_size > subscriber_conn.send_buffer.len) {
+                logger.err("Message too large for {s}: {} > {}", .{ subscriber.identifer, message_size, subscriber_conn.send_buffer.len });
+                total_errors += 1;
+                continue;
+            }
+
+            // 复制消息到订阅者的发送缓冲区
+            @memcpy(subscriber_conn.send_buffer[0..message_size], serialized_message);
+            subscriber_conn.send_len = message_size;
+            subscriber_conn.is_sending = true;
+
+            // 提交异步发送请求
+            // io_uring 会将多个请求批量提交到内核,减少系统调用开销
+            subscriber_conn.state = .Writing;
+            self.broker.io.send(
+                *ClientConnection,
+                subscriber_conn,
+                ClientConnection.onSendComplete,
+                &subscriber_conn.send_completion,
+                subscriber_conn.socket,
+                subscriber_conn.send_buffer[0..message_size],
+            );
+
+            // 记录指标
+            self.broker.metrics.incPublishSent();
+            total_sent += 1;
         }
 
-        // 4. 批量日志记录
-        if (total_sent > 10) {
-            logger.info("Batched forward to {d} subscribers ({d} errors)", .{ total_sent, total_errors });
-        }
+        // 3. 批量日志记录
+        logger.info("Batched async forward to {d} subscribers ({d} dropped, {d} errors)", .{ total_sent, total_dropped, total_errors });
     }
 
     /// 断开连接
@@ -798,7 +975,7 @@ const ClientConnection = struct {
         self.is_disconnecting = true;
 
         self.state = .Disconnecting;
-        logger.info("Client {d} ({s}) disconnecting (clean_start={})", .{ self.id, self.client.identifer, self.client.clean_start });
+        logger.info("Client {d} ({s}) disconnecting (connection_clean_session={})", .{ self.id, self.client.identifer, self.connection_clean_session });
 
         // 记录连接关闭
         self.broker.metrics.incConnectionClosed();
@@ -809,10 +986,11 @@ const ClientConnection = struct {
         // 记录断开时间（用于会话过期判断）
         self.client.disconnect_time = std.time.milliTimestamp();
 
-        // 根据 Clean Session 标志决定是否清理订阅
+        // ⚠️ 关键修复：根据此连接的 clean_session 标志决定是否清理订阅
+        // 不能依赖 self.client.clean_start，因为 Client 对象可能被多个连接共享
         // [MQTT-3.1.2-6] Clean Session = 1: 断开时必须删除会话状态
         // [MQTT-3.1.2-5] Clean Session = 0: 断开时保留会话状态
-        if (self.client.clean_start) {
+        if (self.connection_clean_session) {
             // Clean Session = 1: 清理订阅(从主题树和持久化)
             logger.info("Client {s} disconnecting with Clean Session = 1, clearing all subscriptions", .{self.client.identifer});
             self.broker.subscriptions.unsubscribeAll(self.client);
@@ -1193,19 +1371,9 @@ pub const MqttBroker = struct {
             // 注意：任何网络事件（连接、数据到达等）都会立即中断等待
             self.io.run_for_ns(30 * std.time.ns_per_s) catch |err| {
                 // IO 错误通常是由于已关闭的 socket 触发的，这是正常的断开流程
-                // 只记录非预期的严重错误，其他错误忽略以保持服务器运行
-                switch (err) {
-                    error.Unexpected => {
-                        // Socket 已关闭导致的 Unexpected 错误（如 WSAENOTSOCK）是正常的
-                        // 不需要记录，继续运行
-                        logger.debug("IO unexpected error (likely closed socket): {any}", .{err});
-                    },
-                    else => {
-                        // 其他严重错误才需要关注
-                        logger.err("IO critical error: {any}", .{err});
-                        // 继续运行而不是退出，让服务器保持可用
-                    },
-                }
+                // 记录错误但继续运行，保持服务器可用
+                logger.debug("IO error (likely closed socket or transient issue): {any}", .{err});
+                // 继续运行而不是退出，让服务器保持可用
             };
         }
     }

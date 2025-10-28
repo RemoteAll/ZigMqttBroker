@@ -421,9 +421,19 @@ pub const SubscriptionTree = struct {
             const allocator = self.root.children.allocator;
 
             // 优化：先检查主题树中是否已有订阅
-            // 如果主题树中已有该客户端的订阅(例如旧连接未正确断开),则无需从文件恢复
+            // 如果主题树中已有该客户端的订阅(例如复用了旧 Client 对象),则无需从文件恢复
             if (self.hasClientSubscriptions(client.identifer)) {
                 logger.info("Client '{s}' already has subscriptions in topic tree, skipping restore from file", .{client.identifer});
+                return;
+            }
+
+            // ⚠️ 同时检查客户端对象自己的订阅列表
+            // 如果客户端订阅列表不为空，说明这是复用的旧 Client 对象，订阅已经在内存中
+            if (client.subscriptions.items.len > 0) {
+                logger.info("Client '{s}' already has {d} subscription(s) in memory (reused Client object), skipping restore", .{
+                    client.identifer,
+                    client.subscriptions.items.len,
+                });
                 return;
             }
 

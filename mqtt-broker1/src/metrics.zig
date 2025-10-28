@@ -1,55 +1,60 @@
 const std = @import("std");
 const logger = @import("logger.zig");
+const builtin = @import("builtin");
+
+// 针对 32位架构使用 u32 原子类型，64位架构使用 u64
+const AtomicCounterType = if (builtin.target.ptrBitWidth() == 32) u32 else u64;
 
 /// 原子指标结构体 - 支持多线程安全更新
+/// 注意: 32位架构(如 ARMv7)使用 u32 计数器，64位架构使用 u64
 pub const Metrics = struct {
     // 连接统计
-    connections_current: std.atomic.Value(u64), // 当前连接数
-    connections_total: std.atomic.Value(u64), // 累计连接数
-    connections_refused: std.atomic.Value(u64), // 拒绝连接数
+    connections_current: std.atomic.Value(AtomicCounterType), // 当前连接数
+    connections_total: std.atomic.Value(AtomicCounterType), // 累计连接数
+    connections_refused: std.atomic.Value(AtomicCounterType), // 拒绝连接数
 
     // 消息统计
-    messages_received: std.atomic.Value(u64), // 接收消息数
-    messages_sent: std.atomic.Value(u64), // 发送消息数
-    messages_dropped: std.atomic.Value(u64), // 丢弃消息数
+    messages_received: std.atomic.Value(AtomicCounterType), // 接收消息数
+    messages_sent: std.atomic.Value(AtomicCounterType), // 发送消息数
+    messages_dropped: std.atomic.Value(AtomicCounterType), // 丢弃消息数
 
     // 字节统计
-    bytes_received: std.atomic.Value(u64), // 接收字节数
-    bytes_sent: std.atomic.Value(u64), // 发送字节数
+    bytes_received: std.atomic.Value(AtomicCounterType), // 接收字节数
+    bytes_sent: std.atomic.Value(AtomicCounterType), // 发送字节数
 
     // PUBLISH 统计
-    publish_received: std.atomic.Value(u64), // 接收 PUBLISH 数
-    publish_sent: std.atomic.Value(u64), // 发送 PUBLISH 数
+    publish_received: std.atomic.Value(AtomicCounterType), // 接收 PUBLISH 数
+    publish_sent: std.atomic.Value(AtomicCounterType), // 发送 PUBLISH 数
 
     // 订阅统计
-    subscriptions_current: std.atomic.Value(u64), // 当前订阅数
-    subscriptions_total: std.atomic.Value(u64), // 累计订阅数
+    subscriptions_current: std.atomic.Value(AtomicCounterType), // 当前订阅数
+    subscriptions_total: std.atomic.Value(AtomicCounterType), // 累计订阅数
 
     // 错误统计
-    errors_total: std.atomic.Value(u64), // 总错误数
-    errors_protocol: std.atomic.Value(u64), // 协议错误数
-    errors_network: std.atomic.Value(u64), // 网络错误数
+    errors_total: std.atomic.Value(AtomicCounterType), // 总错误数
+    errors_protocol: std.atomic.Value(AtomicCounterType), // 协议错误数
+    errors_network: std.atomic.Value(AtomicCounterType), // 网络错误数
 
     // 服务器信息
     start_time: i64, // 启动时间戳(毫秒)
 
     pub fn init() Metrics {
         return Metrics{
-            .connections_current = std.atomic.Value(u64).init(0),
-            .connections_total = std.atomic.Value(u64).init(0),
-            .connections_refused = std.atomic.Value(u64).init(0),
-            .messages_received = std.atomic.Value(u64).init(0),
-            .messages_sent = std.atomic.Value(u64).init(0),
-            .messages_dropped = std.atomic.Value(u64).init(0),
-            .bytes_received = std.atomic.Value(u64).init(0),
-            .bytes_sent = std.atomic.Value(u64).init(0),
-            .publish_received = std.atomic.Value(u64).init(0),
-            .publish_sent = std.atomic.Value(u64).init(0),
-            .subscriptions_current = std.atomic.Value(u64).init(0),
-            .subscriptions_total = std.atomic.Value(u64).init(0),
-            .errors_total = std.atomic.Value(u64).init(0),
-            .errors_protocol = std.atomic.Value(u64).init(0),
-            .errors_network = std.atomic.Value(u64).init(0),
+            .connections_current = std.atomic.Value(AtomicCounterType).init(0),
+            .connections_total = std.atomic.Value(AtomicCounterType).init(0),
+            .connections_refused = std.atomic.Value(AtomicCounterType).init(0),
+            .messages_received = std.atomic.Value(AtomicCounterType).init(0),
+            .messages_sent = std.atomic.Value(AtomicCounterType).init(0),
+            .messages_dropped = std.atomic.Value(AtomicCounterType).init(0),
+            .bytes_received = std.atomic.Value(AtomicCounterType).init(0),
+            .bytes_sent = std.atomic.Value(AtomicCounterType).init(0),
+            .publish_received = std.atomic.Value(AtomicCounterType).init(0),
+            .publish_sent = std.atomic.Value(AtomicCounterType).init(0),
+            .subscriptions_current = std.atomic.Value(AtomicCounterType).init(0),
+            .subscriptions_total = std.atomic.Value(AtomicCounterType).init(0),
+            .errors_total = std.atomic.Value(AtomicCounterType).init(0),
+            .errors_protocol = std.atomic.Value(AtomicCounterType).init(0),
+            .errors_network = std.atomic.Value(AtomicCounterType).init(0),
             .start_time = std.time.milliTimestamp(),
         };
     }
@@ -132,27 +137,27 @@ pub const Metrics = struct {
     // 查询接口
     // ========================================================================
 
-    pub fn getConnectionsCurrent(self: *const Metrics) u64 {
+    pub fn getConnectionsCurrent(self: *const Metrics) AtomicCounterType {
         return self.connections_current.load(.monotonic);
     }
 
-    pub fn getConnectionsTotal(self: *const Metrics) u64 {
+    pub fn getConnectionsTotal(self: *const Metrics) AtomicCounterType {
         return self.connections_total.load(.monotonic);
     }
 
-    pub fn getMessagesReceived(self: *const Metrics) u64 {
+    pub fn getMessagesReceived(self: *const Metrics) AtomicCounterType {
         return self.messages_received.load(.monotonic);
     }
 
-    pub fn getMessagesSent(self: *const Metrics) u64 {
+    pub fn getMessagesSent(self: *const Metrics) AtomicCounterType {
         return self.messages_sent.load(.monotonic);
     }
 
-    pub fn getBytesReceived(self: *const Metrics) u64 {
+    pub fn getBytesReceived(self: *const Metrics) AtomicCounterType {
         return self.bytes_received.load(.monotonic);
     }
 
-    pub fn getBytesSent(self: *const Metrics) u64 {
+    pub fn getBytesSent(self: *const Metrics) AtomicCounterType {
         return self.bytes_sent.load(.monotonic);
     }
 
