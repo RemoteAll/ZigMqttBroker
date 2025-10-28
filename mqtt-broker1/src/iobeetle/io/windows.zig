@@ -604,7 +604,8 @@ pub const IO = struct {
         );
     }
 
-    pub const SendError = posix.SendError;
+    // 发送操作在关闭 socket 时会以 WSA_OPERATION_ABORTED 完成，因此需要将取消作为可预期错误返回
+    pub const SendError = posix.SendError || error{OperationCancelled};
 
     pub fn send(
         self: *IO,
@@ -697,9 +698,10 @@ pub const IO = struct {
                         .WSAENETRESET => error.ConnectionResetByPeer,
                         .WSAENOBUFS => error.SystemResources,
                         .WSAENOTCONN => error.FileDescriptorNotASocket,
+                        .WSAENOTSOCK => error.FileDescriptorNotASocket, // 套接字已关闭或无效
                         .WSAEOPNOTSUPP => unreachable, // we dont use MSG_OOB or MSG_PARTIAL
                         .WSAESHUTDOWN => error.BrokenPipe,
-                        .WSA_OPERATION_ABORTED => unreachable, // operation was cancelled
+                        .WSA_OPERATION_ABORTED => error.OperationCancelled, // operation was cancelled
                         else => |err| os.windows.unexpectedWSAError(err),
                     };
                 }
@@ -1127,20 +1129,10 @@ pub const IO = struct {
     pub fn close_socket(self: *IO, socket: socket_t) void {
         _ = self;
 
-        // Windows: 在关闭 socket 前取消所有待处理的 IO 操作
-        // 这样可以避免在已关闭的 socket 上触发回调导致 WSAENOTSOCK (10038) 错误
-        // CancelIoEx 会让待处理的操作以 WSA_OPERATION_ABORTED 错误完成
-        const handle: os.windows.HANDLE = @ptrCast(socket);
-        _ = os.windows.kernel32.CancelIoEx(
-            handle,
-            null, // 取消该 socket 上的所有操作
-        );
-
-        // 给 IOCP 一点时间完成取消操作
-        // 这是一个简单的解决方案，更好的方式是引用计数
-        std.Thread.sleep(1 * std.time.ns_per_ms);
-
-        posix.close(socket);
+        // 对于 WinSock 套接字必须使用 closesocket，而不是 CloseHandle/posix.close。
+        // 先进行半关闭，随后关闭句柄；忽略错误以保证清理路径健壮。
+        _ = posix.shutdown(socket, .both) catch {};
+        _ = os.windows.ws2_32.closesocket(socket);
     }
 
     /// Listen on the given TCP socket.
