@@ -10,6 +10,8 @@ const unsubscribe = @import("handle_unsubscribe.zig");
 const publish = @import("handle_publish.zig");
 const logger = @import("logger.zig");
 const SubscriptionPersistence = @import("persistence.zig").SubscriptionPersistence;
+const ThreadPool = @import("thread_pool.zig").ThreadPool;
+const system_info = @import("system_info.zig");
 const assert = std.debug.assert;
 const net = std.net;
 const mem = std.mem;
@@ -20,6 +22,18 @@ const AutoHashMap = std.AutoHashMap;
 
 const Client = @import("client.zig").Client;
 const ClientError = @import("client.zig").ClientError;
+
+/// 客户端处理任务上下文
+const ClientContext = struct {
+    broker: *MqttBroker,
+    client: *Client,
+};
+
+/// 消息转发任务上下文
+const ForwardContext = struct {
+    subscriber: *Client,
+    packet_data: []const u8,
+};
 
 /// 获取客户端显示名称的辅助函数
 /// 使用线程局部存储避免每次都分配缓冲区
@@ -39,14 +53,36 @@ const MqttBroker = struct {
     subscriptions: SubscriptionTree,
     persistence: *SubscriptionPersistence,
 
+    // 线程池：用于处理客户端连接和消息转发
+    client_pool: *ThreadPool(ClientContext),
+    forward_pool: *ThreadPool(ForwardContext),
+
     pub fn init(allocator: Allocator) !MqttBroker {
         // 初始化订阅持久化管理器
         const persistence = try allocator.create(SubscriptionPersistence);
         persistence.* = try SubscriptionPersistence.init(allocator, "data/subscriptions.json");
 
+        // 创建线程池（使用动态配置）
+        const client_pool_size = config.getClientPoolSize();
+        const forward_pool_size = config.getForwardPoolSize();
+
+        const client_pool = try ThreadPool(ClientContext).init(
+            allocator,
+            client_pool_size,
+        );
+        errdefer client_pool.deinit();
+
+        const forward_pool = try ThreadPool(ForwardContext).init(
+            allocator,
+            forward_pool_size,
+        );
+        errdefer forward_pool.deinit();
+
+        logger.always("Thread pools initialized: client_pool={d}, forward_pool={d}", .{ client_pool_size, forward_pool_size });
+
         // 从文件加载已保存的订阅
-        persistence.loadFromFile() catch |err| {
-            logger.warn("Failed to load persisted subscriptions: {any}", .{err});
+        persistence.loadFromFile() catch {
+            logger.always("No existing subscription persistence file found at 'data/subscriptions.json'", .{});
         };
 
         var subscriptions = SubscriptionTree.init(allocator);
@@ -58,10 +94,16 @@ const MqttBroker = struct {
             .next_client_id = 1,
             .subscriptions = subscriptions,
             .persistence = persistence,
+            .client_pool = client_pool,
+            .forward_pool = forward_pool,
         };
     }
 
     pub fn deinit(self: *MqttBroker) void {
+        // 清理线程池
+        self.client_pool.deinit();
+        self.forward_pool.deinit();
+
         var it = self.clients.iterator();
         while (it.next()) |entry| {
             const client = entry.value_ptr.*;
@@ -77,10 +119,10 @@ const MqttBroker = struct {
 
     // start the server on the given port
     pub fn start(self: *MqttBroker, port: u16) !void {
-        logger.info("Starting MQTT broker server", .{});
         const self_addr = try net.Address.resolveIp("0.0.0.0", port);
         var listener = try self_addr.listen(.{ .reuse_address = true });
-        logger.info("Listening on port {d}", .{port});
+        logger.always("Listening on port {d} [Sync] (address: {any})", .{ port, self_addr });
+        logger.always("Entering accept loop (sync, thread pool mode)...", .{});
 
         while (listener.accept()) |conn| {
             logger.info("Accepted client connection from: {any}", .{conn.address});
@@ -100,9 +142,12 @@ const MqttBroker = struct {
             const client = try Client.init(self.allocator, client_id, mqtt.ProtocolVersion.Invalid, conn.stream, conn.address);
             try self.clients.put(client_id, client);
 
-            // er... use a threadpool for clients? or is this OK
-            const thread = try std.Thread.spawn(.{}, handleClient, .{ self, client });
-            thread.detach(); // 分离线程,允许并发处理多个客户端
+            // 使用线程池处理客户端连接，避免线程爆炸
+            const ctx = ClientContext{
+                .broker = self,
+                .client = client,
+            };
+            try self.client_pool.submit(handleClientPooled, ctx);
         } else |err| {
             logger.err("Error accepting client connection: {any}", .{err});
         }
@@ -192,47 +237,45 @@ const MqttBroker = struct {
         const packet_copy = try self.allocator.dupe(u8, serialized_packet);
         defer self.allocator.free(packet_copy);
 
-        // 使用线程批量发送
-        var threads = try self.allocator.alloc(std.Thread, subscribers.len);
-        defer self.allocator.free(threads);
+        // 使用线程池批量提交转发任务
+        var contexts = try self.allocator.alloc(ForwardContext, subscribers.len);
+        defer self.allocator.free(contexts);
 
-        var thread_count: usize = 0;
+        var ctx_count: usize = 0;
         for (subscribers) |subscriber| {
             if (!subscriber.is_connected) {
                 logger.warn("   ⚠️  Skipping disconnected subscriber: {s}", .{subscriber.identifer});
                 continue;
             }
 
-            const ForwardContext = struct {
-                subscriber: *Client,
-                packet_data: []const u8,
-            };
-
-            const ctx = ForwardContext{
+            contexts[ctx_count] = ForwardContext{
                 .subscriber = subscriber,
                 .packet_data = packet_copy,
             };
-
-            threads[thread_count] = try std.Thread.spawn(.{}, forwardWorker, .{ctx});
-            thread_count += 1;
+            ctx_count += 1;
         }
 
-        // 等待所有线程完成
-        for (threads[0..thread_count]) |thread| {
-            thread.join();
-        }
+        // 批量提交到线程池
+        try self.forward_pool.submitBatch(forwardWorker, contexts[0..ctx_count]);
 
-        logger.debug("   ✅ Forwarded to {d} subscribers concurrently", .{thread_count});
+        logger.debug("   ✅ Forwarded to {d} subscribers concurrently", .{ctx_count});
     }
 
     /// 并发转发的工作线程
-    fn forwardWorker(ctx: anytype) void {
+    fn forwardWorker(ctx: ForwardContext) void {
         const stream = &ctx.subscriber.stream;
         stream.writeAll(ctx.packet_data) catch |err| {
             logger.err("   ❌ Failed to send to {s}: {any}", .{ ctx.subscriber.identifer, err });
             return;
         };
         logger.debug("   ✅ Forwarded to {s}", .{ctx.subscriber.identifer});
+    }
+
+    /// 线程池包装：处理客户端连接
+    fn handleClientPooled(ctx: ClientContext) void {
+        handleClient(ctx.broker, ctx.client) catch |err| {
+            logger.err("Error handling client {d}: {any}", .{ ctx.client.id, err });
+        };
     }
 
     /// add a new client to the broker with a threaded event loop
@@ -546,20 +589,27 @@ const MqttBroker = struct {
 pub fn main() !void {
     // 配置日志系统
     const is_debug_mode = @import("builtin").mode == .Debug;
-    logger.setLevel(if (is_debug_mode) .debug else .info);
+    logger.setLevel(if (is_debug_mode) .debug else config.DEFAULT_LOG_LEVEL);
 
-    logger.info("=== MQTT Broker Starting ===", .{});
-    logger.info("Build mode: {s}", .{if (is_debug_mode) "Debug" else "Release"});
-    logger.info("Log level: {s}", .{if (is_debug_mode) "DEBUG" else "INFO"});
+    logger.always("=== MQTT Broker Starting (Sync) ===", .{});
+    logger.always("Build mode: {s}", .{if (is_debug_mode) "Debug" else "Release"});
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // 获取并打印系统信息
+    const sys_info = try system_info.getSystemInfo(allocator);
+    defer system_info.freeSystemInfo(sys_info, allocator);
+    system_info.printSystemInfo(sys_info, allocator);
+
+    // 打印配置摘要
+    config.printConfig();
+
     var broker = try MqttBroker.init(allocator);
     defer broker.deinit();
 
-    // TODO have a config file that updates values in config.zig
+    logger.always("Starting MQTT broker server", .{});
 
     try broker.start(config.PORT);
 }

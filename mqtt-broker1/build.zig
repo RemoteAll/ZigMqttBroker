@@ -1,19 +1,97 @@
 const std = @import("std");
 
-// Although this function looks imperative, note that its job is to
-// declaratively construct a build graph that will be executed by an external
-// runner.
-pub fn build(b: *std.Build) void {
-    // Standard target options allows the person running `zig build` to choose
-    // what target to build for. Here we do not override the defaults, which
-    // means any target is allowed, and the default is native. Other options
-    // for restricting supported target set are available.
-    const target = b.standardTargetOptions(.{});
+/// 平台配置结构
+const PlatformConfig = struct {
+    name: []const u8,
+    optimize: std.builtin.OptimizeMode,
+    linkage: std.builtin.LinkMode,
+    strip: bool,
+    use_sync: bool, // 是否强制使用同步版本
+};
 
-    // Standard optimization options allow the person running `zig build` to select
-    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
-    // set a preferred release mode, allowing the user to decide how to optimize.
+/// 检测平台类型并返回优化配置
+fn detectPlatformConfig(target_query: std.Target.Query, optimize: std.builtin.OptimizeMode) PlatformConfig {
+    const cpu_arch = target_query.cpu_arch orelse @import("builtin").cpu.arch;
+
+    // 检测是否是嵌入式 ARM 设备（使用 musl）
+    const is_embedded_arm = blk: {
+        if (cpu_arch != .arm) break :blk false;
+
+        // musl libc + ARM 32位 → 嵌入式设备（如 OpenWrt）
+        if (target_query.abi) |abi| {
+            if (abi == .musleabi or abi == .musleabihf) {
+                break :blk true;
+            }
+        }
+        break :blk false;
+    };
+
+    // 检测是否是高性能服务器平台
+    const is_high_perf = blk: {
+        if (is_embedded_arm) break :blk false;
+
+        // x86_64 或 aarch64 → 高性能服务器
+        if (cpu_arch == .x86_64 or cpu_arch == .aarch64) {
+            break :blk true;
+        }
+        break :blk false;
+    };
+
+    // 根据平台返回优化配置
+    if (is_embedded_arm) {
+        return PlatformConfig{
+            .name = "embedded_arm",
+            .optimize = .ReleaseSafe, // 嵌入式：安全和体积优先
+            .linkage = .static, // 静态链接提高兼容性
+            .strip = true, // 减小二进制体积
+            .use_sync = true, // 强制使用同步版本（io_uring 不可用）
+        };
+    } else if (is_high_perf) {
+        return PlatformConfig{
+            .name = "high_perf",
+            .optimize = switch (optimize) {
+                .Debug => .Debug,
+                else => .ReleaseFast, // 高性能：速度第一
+            },
+            .linkage = .dynamic, // 动态链接使用系统优化库
+            .strip = false, // 保留符号便于性能分析
+            .use_sync = false, // 优先使用异步版本
+        };
+    } else {
+        return PlatformConfig{
+            .name = "generic",
+            .optimize = optimize,
+            .linkage = .dynamic,
+            .strip = false,
+            .use_sync = true, // 其他平台：兼容性优先，使用同步版本
+        };
+    }
+}
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // ========== 平台检测与配置 ==========
+    const platform_config = detectPlatformConfig(target.query, optimize);
+
+    // 输出平台信息（编译时）
+    const platform_info = b.fmt(
+        \\
+        \\===== Build Configuration =====
+        \\Platform: {s}
+        \\Optimize: {s}
+        \\Linkage: {s}
+        \\Preferred: {s} version
+        \\================================
+        \\
+    , .{
+        platform_config.name,
+        @tagName(platform_config.optimize),
+        @tagName(platform_config.linkage),
+        if (platform_config.use_sync) "sync" else "async",
+    });
+    _ = platform_info; // 暂时不输出，避免干扰构建日志
 
     // 根据目标平台生成带平台标识的文件名
     const target_query = target.query;
@@ -38,110 +116,123 @@ pub fn build(b: *std.Build) void {
         break :blk b.fmt("-{s}-{s}", .{ os_name, arch_name });
     };
 
-    // 异步版本 (使用 iobeetle IO) - 默认主程序
+    // 异步版本 (使用 iobeetle IO) - 高性能平台默认
     const exe_async = b.addExecutable(.{
         .name = b.fmt("mqtt-broker-async{s}", .{platform_suffix}),
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main_async.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = platform_config.optimize,
         }),
     });
-    // 如果目标是 musl，使用静态链接
-    const is_musl = if (target.query.abi) |abi|
-        abi == .musl or abi == .musleabi or abi == .musleabihf
-    else
-        false;
-    if (is_musl) {
-        exe_async.linkage = .static;
-    }
 
-    // 同步版本（保留用于对比测试）
+    // 应用平台特定配置
+    exe_async.linkage = platform_config.linkage;
+    exe_async.root_module.strip = platform_config.strip;
+
+    // 同步版本（兼容性优先，支持所有平台）
     const exe_sync = b.addExecutable(.{
         .name = b.fmt("mqtt-broker-sync{s}", .{platform_suffix}),
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = platform_config.optimize,
         }),
     });
-    if (is_musl) {
-        exe_sync.linkage = .static;
-    }
+
+    // 应用平台特定配置
+    exe_sync.linkage = platform_config.linkage;
+    exe_sync.root_module.strip = platform_config.strip;
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
-    b.installArtifact(exe_async);
-    b.installArtifact(exe_sync);
+
+    // 根据平台配置决定安装哪个版本
+    if (!platform_config.use_sync) {
+        // 高性能平台：优先安装异步版本
+        b.installArtifact(exe_async);
+        b.installArtifact(exe_sync); // 也安装同步版本作为备选
+    } else {
+        // 嵌入式/兼容性平台：优先安装同步版本
+        b.installArtifact(exe_sync);
+        // 仍然尝试构建异步版本（可能在运行时失败）
+        b.installArtifact(exe_async);
+    }
 
     // 添加交叉编译目标（针对不同平台和架构）
-    const cross_targets = [_]std.Target.Query{
-        // Linux ARMv7 (32位) - 适用于树莓派等设备
-        // 修复：使用 baseline CPU 特性，避免 illegal instruction
+    const cross_targets = [_]struct {
+        query: std.Target.Query,
+        name: []const u8,
+    }{
+        // 嵌入式 ARM (OpenWrt) - ARMv6 软浮点 + musl + 静态链接
         .{
-            .cpu_arch = .arm,
-            .os_tag = .linux,
-            .abi = .gnueabihf,
-            // 不指定 cpu_model，让 Zig 自动选择兼容的基线
-            // 不手动添加 CPU 特性，避免指令集不兼容
+            .query = .{
+                .cpu_arch = .arm,
+                .os_tag = .linux,
+                .abi = .musleabi, // 软浮点，最大兼容性
+                // 使用 baseline CPU，不指定特定型号
+            },
+            .name = "linux-arm-embedded",
         },
-        // Linux ARM64
+        // Linux ARM64 服务器
         .{
-            .cpu_arch = .aarch64,
-            .os_tag = .linux,
-            .abi = .gnu,
+            .query = .{
+                .cpu_arch = .aarch64,
+                .os_tag = .linux,
+                .abi = .gnu, // glibc，高性能
+            },
+            .name = "linux-aarch64",
         },
-        // Linux x86_64
+        // Linux x86_64 服务器
         .{
-            .cpu_arch = .x86_64,
-            .os_tag = .linux,
-            .abi = .gnu,
+            .query = .{
+                .cpu_arch = .x86_64,
+                .os_tag = .linux,
+                .abi = .gnu, // glibc，高性能
+            },
+            .name = "linux-x86_64",
+        },
+        // Windows x86_64
+        .{
+            .query = .{
+                .cpu_arch = .x86_64,
+                .os_tag = .windows,
+                .abi = .gnu,
+            },
+            .name = "windows-x86_64",
         },
     };
 
     // 为每个目标创建交叉编译步骤
     for (cross_targets) |cross_target| {
-        const cross_target_resolved = b.resolveTargetQuery(cross_target);
-
-        const cross_platform_suffix = blk: {
-            const os_name = switch (cross_target.os_tag.?) {
-                .linux => "linux",
-                .windows => "windows",
-                .macos => "macos",
-                else => "unknown",
-            };
-
-            const arch_name = switch (cross_target.cpu_arch.?) {
-                .x86_64 => "x86_64",
-                .aarch64 => "aarch64",
-                .arm => "armv7",
-                else => "unknown",
-            };
-
-            break :blk b.fmt("-{s}-{s}", .{ os_name, arch_name });
-        };
+        const cross_target_resolved = b.resolveTargetQuery(cross_target.query);
+        const cross_platform_config = detectPlatformConfig(cross_target.query, .ReleaseFast);
 
         // 异步版本交叉编译
         const cross_exe_async = b.addExecutable(.{
-            .name = b.fmt("mqtt-broker-async{s}", .{cross_platform_suffix}),
+            .name = b.fmt("mqtt-broker-async-{s}", .{cross_target.name}),
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main_async.zig"),
                 .target = cross_target_resolved,
-                .optimize = .ReleaseFast,
+                .optimize = cross_platform_config.optimize,
             }),
         });
+        cross_exe_async.linkage = cross_platform_config.linkage;
+        cross_exe_async.root_module.strip = cross_platform_config.strip;
         b.installArtifact(cross_exe_async);
 
         // 同步版本交叉编译
         const cross_exe_sync = b.addExecutable(.{
-            .name = b.fmt("mqtt-broker-sync{s}", .{cross_platform_suffix}),
+            .name = b.fmt("mqtt-broker-sync-{s}", .{cross_target.name}),
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main.zig"),
                 .target = cross_target_resolved,
-                .optimize = .ReleaseFast,
+                .optimize = cross_platform_config.optimize,
             }),
         });
+        cross_exe_sync.linkage = cross_platform_config.linkage;
+        cross_exe_sync.root_module.strip = cross_platform_config.strip;
         b.installArtifact(cross_exe_sync);
     }
 
@@ -166,8 +257,14 @@ pub fn build(b: *std.Build) void {
     // This creates a build step. It will be visible in the `zig build --help` menu,
     // and can be selected like this: `zig build run`
     // This will evaluate the `run` step rather than the default, which is "install".
-    const run_step = b.step("run", "Run the app (async version by default)");
-    run_step.dependOn(&run_async_cmd.step);
+
+    // 默认 run 根据平台配置自动选择版本
+    const run_step = b.step("run", "Run the MQTT broker (auto-select version based on platform)");
+    if (platform_config.use_sync) {
+        run_step.dependOn(&run_sync_cmd.step);
+    } else {
+        run_step.dependOn(&run_async_cmd.step);
+    }
 
     // 异步版本运行步骤（保留向后兼容）
     const run_async_step = b.step("run-async", "Run the async IO version");

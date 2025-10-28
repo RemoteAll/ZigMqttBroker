@@ -11,6 +11,7 @@ const publish = @import("handle_publish.zig");
 const logger = @import("logger.zig");
 const Metrics = @import("metrics.zig").Metrics;
 const SubscriptionPersistence = @import("persistence.zig").SubscriptionPersistence;
+const system_info = @import("system_info.zig");
 const assert = std.debug.assert;
 const net = std.net;
 const mem = std.mem;
@@ -583,6 +584,18 @@ const ClientConnection = struct {
         try connect.connackAsync(self.writer, session_present, reason_code);
         try self.sendAsync();
 
+        // 获取客户端显示名称
+        const S = struct {
+            threadlocal var buffer: [128]u8 = undefined;
+        };
+        const client_name = self.client.getDisplayName(&S.buffer) catch "Client";
+
+        logger.info("{s} connected successfully (keep_alive={d}s, clean_session={any})", .{
+            client_name,
+            self.client.keep_alive,
+            connect_packet.connect_flags.clean_session,
+        });
+
         // 根据 Clean Session 标志判断连接类型
         const connection_type = if (connect_packet.connect_flags.clean_session)
             "NEW/CLEAN" // Clean Session = 1: 明确要求清除旧会话
@@ -591,13 +604,7 @@ const ClientConnection = struct {
         else
             "NEW/PERSISTENT"; // Clean Session = 0 但没有旧会话（首次连接或会话已过期）
 
-        logger.info("Client {d} ({s}) connected successfully [{s}] (CleanSession={}, SessionPresent={})", .{
-            self.id,
-            self.client.identifer,
-            connection_type,
-            connect_packet.connect_flags.clean_session,
-            session_present,
-        });
+        _ = connection_type; // 保留用于调试
 
         // 只有在明确需要从持久化恢复时才调用 restoreClientSubscriptions
         // 避免重复恢复（复用旧 Client 对象时订阅已经在内存中）
@@ -614,12 +621,18 @@ const ClientConnection = struct {
     fn handleSubscribe(self: *ClientConnection) !void {
         const subscribe_packet = try subscribe.read(&self.reader, self.client, self.arena.allocator());
 
-        logger.debug("Client {d} SUBSCRIBE {d} topics", .{ self.id, subscribe_packet.topics.items.len });
+        // 获取客户端显示名称
+        const S = struct {
+            threadlocal var buffer: [128]u8 = undefined;
+        };
+        const client_name = self.client.getDisplayName(&S.buffer) catch "Client";
+
+        logger.debug("Processing SUBSCRIBE packet with {d} topic(s)", .{subscribe_packet.topics.items.len});
 
         for (subscribe_packet.topics.items) |topic| {
             try self.broker.subscriptions.subscribe(topic.filter, self.client);
             self.broker.metrics.incSubscription();
-            logger.info("Client {d} ({s}) subscribed to: {s}", .{ self.id, self.client.identifer, topic.filter });
+            logger.info("{s} subscribed to topic: {s} (QoS {d})", .{ client_name, topic.filter, @intFromEnum(topic.options.qos) });
         }
 
         // 发送 SUBACK (使用异步版本)
@@ -631,12 +644,19 @@ const ClientConnection = struct {
     fn handlePublish(self: *ClientConnection) !void {
         const publish_packet = try publish.read(&self.reader);
 
+        // 获取客户端显示名称
+        const S = struct {
+            threadlocal var buffer: [128]u8 = undefined;
+        };
+        const client_name = self.client.getDisplayName(&S.buffer) catch "Client";
+
+        logger.debug("{s} sent PUBLISH", .{client_name});
+
         // 更新指标
         self.broker.metrics.incPublishReceived();
 
-        logger.info("Client {d} ({s}) published to '{s}' ({d} bytes)", .{
-            self.id,
-            self.client.identifer,
+        logger.info("{s} published to '{s}' (payload: {d} bytes)", .{
+            client_name,
             publish_packet.topic,
             publish_packet.payload.len,
         });
@@ -668,7 +688,7 @@ const ClientConnection = struct {
         defer matched_clients.deinit(arena_allocator);
 
         if (matched_clients.items.len > 0) {
-            logger.debug("Forwarding to {d} subscribers", .{matched_clients.items.len});
+            logger.info("   📨 Found {d} matching subscriber(s)", .{matched_clients.items.len});
 
             // 智能转发策略：根据订阅者数量选择最优方法
             // 1 个订阅者：直接发送（无需序列化共享）
@@ -687,10 +707,16 @@ const ClientConnection = struct {
     fn handleUnsubscribe(self: *ClientConnection) !void {
         const unsubscribe_packet = try unsubscribe.read(&self.reader, self.arena.allocator());
 
+        // 获取客户端显示名称
+        const S = struct {
+            threadlocal var buffer: [128]u8 = undefined;
+        };
+        const client_name = self.client.getDisplayName(&S.buffer) catch "Client";
+
         for (unsubscribe_packet.topics.items) |topic_filter| {
             _ = try self.broker.subscriptions.unsubscribe(topic_filter, self.client);
             self.broker.metrics.decSubscription();
-            logger.info("Client {d} ({s}) unsubscribed from: {s}", .{ self.id, self.client.identifer, topic_filter });
+            logger.info("{s} unsubscribed from topic: {s}", .{ client_name, topic_filter });
         }
 
         // 发送 UNSUBACK (使用异步版本)
@@ -1167,7 +1193,7 @@ pub const MqttBroker = struct {
         // 只预热初始大小的连接池（通常 1K-5K）
         // 这样前期内存占用很小，不会浪费
         try client_pool.preheat(config.INITIAL_POOL_SIZE);
-        logger.info(
+        logger.always(
             "Client pool initialized: initial_size={d}, max_size={d}",
             .{ config.INITIAL_POOL_SIZE, config.MAX_POOL_SIZE },
         );
@@ -1352,7 +1378,7 @@ pub const MqttBroker = struct {
             },
         );
 
-        logger.info("Listening on {any}", .{resolved_addr});
+        logger.always("Listening on port {d} [Async] (address: {any})", .{ port, resolved_addr });
 
         // 开始接受连接
         self.startAccept();
@@ -1362,7 +1388,7 @@ pub const MqttBroker = struct {
 
         // 进入事件循环（阻塞模式，避免CPU忙等待）
         // 使用 run_for_ns 而非 run，确保在没有事件时阻塞等待而非轮询
-        logger.info("Entering event loop...", .{});
+        logger.always("Entering event loop...", .{});
         while (true) {
             // 阻塞等待最多30秒（或直到有事件/超时发生）
             // iobeetle 会根据已注册的定时器（如心跳、统计）自动计算实际等待时间
@@ -1442,7 +1468,7 @@ pub const MqttBroker = struct {
             return;
         };
 
-        logger.info("Accepted socket: {any}", .{client_socket});
+        logger.info("Accepted client connection (socket: {any})", .{client_socket});
 
         // 检查连接数限制
         if (self.clients.count() >= config.MAX_CONNECTIONS) {
@@ -1453,7 +1479,6 @@ pub const MqttBroker = struct {
             return;
         }
 
-        logger.info("Accepted new connection (socket={any})", .{client_socket});
         self.metrics.incConnectionAccepted();
 
         // 自动扩展连接池（如果需要）
@@ -1519,16 +1544,9 @@ pub const MqttBroker = struct {
 };
 
 pub fn main() !void {
-    // 第一行输出：确认程序启动
-    std.debug.print("=== MQTT Broker Starting ===\n", .{});
-    std.debug.print("Platform: {s}\n", .{@tagName(@import("builtin").os.tag)});
-    std.debug.print("CPU: {s}\n", .{@tagName(@import("builtin").cpu.arch)});
-
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-
-    std.debug.print("Memory allocator initialized\n", .{});
 
     // 设置日志级别（根据配置）
     logger.setLevel(switch (config.DEFAULT_LOG_LEVEL) {
@@ -1538,18 +1556,27 @@ pub fn main() !void {
         .err => .err,
     });
 
-    std.debug.print("Logger initialized\n", .{});
+    logger.always("=== MQTT Broker Starting (Async) ===", .{});
+    logger.always("Build mode: {s}", .{@tagName(@import("builtin").mode)});
+
+    // 获取并打印系统信息
+    const sys_info = try system_info.getSystemInfo(allocator);
+    defer system_info.freeSystemInfo(sys_info, allocator);
+    system_info.printSystemInfo(sys_info, allocator);
+
+    // 打印配置信息
+    config.printConfig();
 
     const broker = MqttBroker.init(allocator) catch |err| {
-        std.debug.print("FATAL: Failed to initialize broker: {any}\n", .{err});
+        logger.err("Failed to initialize broker: {any}", .{err});
         return err;
     };
     defer broker.deinit();
 
-    std.debug.print("Broker initialized, starting server...\n", .{});
+    logger.always("Starting MQTT broker server", .{});
 
     broker.start(1883) catch |err| {
-        std.debug.print("FATAL: Failed to start broker: {any}\n", .{err});
+        logger.err("Failed to start broker: {any}", .{err});
         return err;
     };
 }

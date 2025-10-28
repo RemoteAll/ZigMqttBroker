@@ -1,4 +1,89 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const logger = @import("logger.zig");
+
+// ========================================================================
+// 平台检测与性能分级
+// ========================================================================
+
+/// 部署场景类型
+pub const DeploymentProfile = enum {
+    /// 高性能服务器（Linux io_uring / Windows IOCP）
+    /// 目标：100万+ 并发连接
+    high_performance,
+
+    /// 标准服务器（阻塞 I/O + 线程池）
+    /// 目标：10K-50K 并发连接
+    standard,
+
+    /// 嵌入式设备（资源受限）
+    /// 目标：100-5K 并发连接
+    embedded,
+
+    /// 开发环境（快速调试）
+    development,
+};
+
+/// 获取当前部署场景（编译期决策）
+pub fn getDeploymentProfile() DeploymentProfile {
+    // 编译模式判断
+    if (builtin.mode == .Debug) {
+        return .development;
+    }
+
+    // 目标架构判断
+    if (builtin.cpu.arch == .arm or builtin.cpu.arch == .thumb) {
+        return .embedded;
+    }
+
+    // 根据优化等级判断
+    if (builtin.mode == .ReleaseFast or builtin.mode == .ReleaseSmall) {
+        // 假设 ReleaseFast 用于高性能服务器
+        return .high_performance;
+    }
+
+    return .standard;
+}
+
+/// 根据部署场景获取推荐的最大连接数
+pub fn getMaxConnections() u32 {
+    return switch (getDeploymentProfile()) {
+        .high_performance => 1_000_000, // 100万
+        .standard => 50_000, // 5万
+        .embedded => 5_000, // 5千
+        .development => 1_000, // 1千
+    };
+}
+
+/// 根据部署场景获取初始池大小
+pub fn getInitialPoolSize() u32 {
+    return switch (getDeploymentProfile()) {
+        .high_performance => 10_000, // 预热 1万连接
+        .standard => 2_000, // 预热 2千连接
+        .embedded => 500, // 预热 500连接
+        .development => 100, // 预热 100连接
+    };
+}
+
+/// 根据部署场景获取转发批次大小
+pub fn getForwardBatchSize() u32 {
+    return switch (getDeploymentProfile()) {
+        .high_performance => 10_000, // 大批次，减少系统调用
+        .standard => 1_000, // 中等批次
+        .embedded => 100, // 小批次，节省内存
+        .development => 50, // 小批次，易调试
+    };
+}
+
+/// 根据部署场景获取日志级别
+pub fn getDefaultLogLevel() logger.Level {
+    return switch (getDeploymentProfile()) {
+        .high_performance => .warn, // 最小日志，最高性能
+        .standard => .info, // 平衡
+        .embedded => .warn, // 减少 I/O
+        .development => .debug, // 详细日志
+    };
+}
 
 // ========================================================================
 // 服务器配置
@@ -7,37 +92,44 @@ pub const PORT = 1883;
 pub const KERNEL_BACKLOG = 128;
 
 // ========================================================================
-// 连接限制
+// 连接限制（动态配置）
 // ========================================================================
-pub const MAX_CONNECTIONS = 1_000_000; // 最大并发连接数（100万）
-// IO操作队列深度 - Linux io_uring 内核会自动向上取整到最近的2的幂次方
-// 直接设置为 4096 (2^12), 内核原样使用无需调整
-// 注意: Windows IOCP 完全忽略此参数
+
+/// 最大并发连接数（根据部署场景自动调整）
+pub const MAX_CONNECTIONS = getMaxConnections();
+
+/// IO操作队列深度 - Linux io_uring 内核会自动向上取整到最近的2的幂次方
+/// 直接设置为 4096 (2^12), 内核原样使用无需调整
+/// 注意: Windows IOCP 完全忽略此参数
 pub const IO_ENTRIES = 4096; // 2^12 = 4096 (io_uring 最佳实践值)
 pub const QUEUE_DEPTH = 4096; // 传统队列深度(向后兼容)
 
 // ========================================================================
-// 内存池配置
+// 内存池配置（动态配置）
 // ========================================================================
-// 初始预热大小：启动时立即分配的连接对象数
-// 设置策略：根据预期的初期连接数设置，通常为峰值的 5-20%
-// - 太小：频繁动态分配，连接建立延迟增加
-// - 太大：初期内存占用多，闲置浪费
-// 建议初值：1024（即使最终目标是 1M，也从小开始）
-pub const INITIAL_POOL_SIZE = 1024;
 
-// 最大连接数（连接池容量上限）
-// 当活跃连接超过 INITIAL_POOL_SIZE 时，会逐步动态扩展
-// 但总数不超过 MAX_CONNECTIONS
-pub const MAX_POOL_SIZE = 100_000;
+/// 初始预热大小：启动时立即分配的连接对象数
+/// 根据部署场景自动调整（高性能 10K / 标准 2K / 嵌入式 500 / 开发 100）
+pub const INITIAL_POOL_SIZE = getInitialPoolSize();
+
+/// 最大连接池大小（与 MAX_CONNECTIONS 同步）
+pub const MAX_POOL_SIZE = MAX_CONNECTIONS;
 
 pub const MAX_MESSAGES_POOL = 10_000; // 消息池大小
 
 // ========================================================================
-// 缓冲区大小
+// 缓冲区大小（针对高吞吐优化）
 // ========================================================================
-pub const READ_BUFFER_SIZE = 4096; // 读取缓冲区(4KB)
-pub const WRITE_BUFFER_SIZE = 4096; // 写入缓冲区(4KB)
+
+/// 每连接读缓冲区大小
+/// 权衡：大缓冲 = 减少系统调用 vs 增加内存占用
+/// - 4KB: 适合小消息场景（传感器数据）
+/// - 8KB: 适合混合场景
+/// - 16KB: 适合大消息场景（图片上传）
+pub const READ_BUFFER_SIZE = if (getDeploymentProfile() == .embedded) 2048 else 4096;
+
+/// 每连接写缓冲区大小
+pub const WRITE_BUFFER_SIZE = if (getDeploymentProfile() == .embedded) 2048 else 4096;
 pub const MAXIMUM_MESSAGE_SIZE = 256 * 1024; // 最大消息256KB
 
 // ========================================================================
@@ -75,30 +167,83 @@ pub const STATS_PUBLISH_INTERVAL_SEC = 60; // 统计信息发布间隔(秒) - 1�
 pub const STATS_INTERVAL_NS = STATS_PUBLISH_INTERVAL_SEC * std.time.ns_per_s; // 纳秒单位
 
 // ========================================================================
-// 转发优化配置
+// 转发优化配置（动态配置）
 // ========================================================================
-// 批量转发触发阈值（订阅者数量 >= 此值时使用批量转发）
+
+/// 批量转发触发阈值（订阅者数量 >= 此值时使用批量转发）
 pub const BATCH_FORWARD_THRESHOLD = 10;
 
-// 批量转发每批大小（平衡内存占用和系统调用次数）
-// - 值越大：系统调用越少，但单次失败影响面越大
-// - 值越小：容错性越好，但系统调用越多
-// - 推荐值：100-1000（100万连接场景建议 5000-10000）
-pub const FORWARD_BATCH_SIZE = 5000; // 100万设备优化
+/// 批量转发每批大小（根据部署场景自动调整）
+/// - 高性能：10K（减少系统调用，最大化吞吐）
+/// - 标准：1K（平衡性能和内存）
+/// - 嵌入式：100（节省内存）
+pub const FORWARD_BATCH_SIZE = getForwardBatchSize();
 
 // ========================================================================
-// 日志配置
+// 线程池配置（仅同步版本使用）
 // ========================================================================
-pub const LogLevel = enum {
-    debug, // 详细调试信息（性能影响大，仅开发环境使用）
-    info, // 一般信息（默认，生产环境推荐）
-    warn, // 警告信息
-    err, // 仅错误信息（高性能场景）
-};
 
-// 默认日志级别
-// - debug: 开发调试，输出所有细节（性能损失 30-50%）
-// - info: 生产默认，输出关键操作（性能影响 < 5%）
-// - warn: 仅警告和错误（性能影响 < 1%）
-// - err: 仅错误信息（性能影响 < 0.1%）
-pub const DEFAULT_LOG_LEVEL = LogLevel.info;
+/// 获取客户端处理线程池大小
+pub fn getClientPoolSize() u32 {
+    const cpu_count = std.Thread.getCpuCount() catch 4;
+    return switch (getDeploymentProfile()) {
+        .high_performance => @min(cpu_count * 2, 32), // CPU × 2，最多 32
+        .standard => @min(cpu_count * 2, 16), // CPU × 2，最多 16
+        .embedded => @min(cpu_count, 4), // CPU 数量，最多 4
+        .development => 4, // 固定 4 线程
+    };
+}
+
+/// 获取消息转发线程池大小
+pub fn getForwardPoolSize() u32 {
+    const cpu_count = std.Thread.getCpuCount() catch 4;
+    return switch (getDeploymentProfile()) {
+        .high_performance => @min(cpu_count * 4, 64), // CPU × 4，最多 64
+        .standard => @min(cpu_count * 2, 32), // CPU × 2，最多 32
+        .embedded => @min(cpu_count, 8), // CPU 数量，最多 8
+        .development => 4, // 固定 4 线程
+    };
+}
+
+// ========================================================================
+// 日志配置（动态配置）
+// ========================================================================
+
+/// 默认日志级别（根据部署场景自动调整）
+/// - 开发：debug（详细日志，性能影响 30-50%）
+/// - 标准：info（关键操作，性能影响 < 5%）
+/// - 高性能/嵌入式：warn（仅警告，性能影响 < 1%）
+pub const DEFAULT_LOG_LEVEL = getDefaultLogLevel();
+
+// ========================================================================
+// 性能监控配置
+// ========================================================================
+
+/// 是否启用性能监控
+pub const ENABLE_METRICS = (getDeploymentProfile() != .embedded);
+
+/// 是否启用内存追踪
+pub const ENABLE_MEMORY_TRACKING = (getDeploymentProfile() == .development);
+
+// ========================================================================
+// 配置摘要打印（启动时显示）
+// ========================================================================
+
+pub fn printConfig() void {
+    const profile = getDeploymentProfile();
+    std.debug.print("\n=== MQTT Broker Configuration ===\n", .{});
+    std.debug.print("Deployment Profile: {s}\n", .{@tagName(profile)});
+    std.debug.print("Max Connections: {d}\n", .{MAX_CONNECTIONS});
+    std.debug.print("Initial Pool Size: {d}\n", .{INITIAL_POOL_SIZE});
+    std.debug.print("Forward Batch Size: {d}\n", .{FORWARD_BATCH_SIZE});
+    std.debug.print("Log Level: {s}\n", .{@tagName(DEFAULT_LOG_LEVEL)});
+    std.debug.print("Read Buffer: {d} KB\n", .{READ_BUFFER_SIZE / 1024});
+    std.debug.print("Write Buffer: {d} KB\n", .{WRITE_BUFFER_SIZE / 1024});
+
+    if (profile == .standard or profile == .embedded) {
+        std.debug.print("Client Thread Pool: {d}\n", .{getClientPoolSize()});
+        std.debug.print("Forward Thread Pool: {d}\n", .{getForwardPoolSize()});
+    }
+
+    std.debug.print("=================================\n\n", .{});
+}

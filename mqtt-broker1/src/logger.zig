@@ -252,6 +252,32 @@ pub fn err(comptime fmt: []const u8, args: anytype) void {
     log(.err, fmt, args);
 }
 
+/// 强制输出日志（忽略全局日志级别，用于启动信息等关键日志）
+pub fn always(comptime fmt: []const u8, args: anytype) void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // 获取时间戳
+    const timestamp = getTimestamp(allocator) catch "????-??-?? ??:??:??.?????????";
+
+    // 格式化用户消息
+    const message = std.fmt.allocPrint(allocator, fmt, args) catch return;
+
+    // 组装完整日志（使用 INFO 级别的样式）
+    const color_code = "\x1b[32m"; // 绿色
+    const reset_code = "\x1b[0m";
+    const level_label = "INFO";
+
+    const full_message = std.fmt.allocPrint(
+        allocator,
+        "{s}[{s}] {s}{s}{s} {s}\n",
+        .{ color_code, timestamp, color_code, level_label, reset_code, message },
+    ) catch return;
+
+    printUtf8(full_message);
+}
+
 /// 不带时间戳和级别的简单打印（用于替换原有的简单打印场景）
 pub fn print(comptime fmt: []const u8, args: anytype) void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
