@@ -268,3 +268,167 @@ pub fn printSystemInfo(info: SystemInfo, allocator: std.mem.Allocator) void {
 pub fn freeSystemInfo(info: SystemInfo, allocator: std.mem.Allocator) void {
     allocator.free(info.hostname);
 }
+
+// ========================================================================
+// 运行时资源监控（用于统计日志）
+// ========================================================================
+
+/// 进程资源使用情况
+pub const ProcessResourceUsage = struct {
+    /// 进程内存占用（RSS - Resident Set Size，字节）
+    memory_rss: u64,
+    /// 进程虚拟内存占用（VSZ，字节）
+    memory_vsz: u64,
+    /// CPU 占用率（百分比，0-100 * CPU核心数）
+    cpu_usage_percent: f64,
+};
+
+/// 系统资源使用情况
+pub const SystemResourceUsage = struct {
+    /// 系统总内存（字节）
+    total_memory: u64,
+    /// 系统可用内存（字节）
+    available_memory: u64,
+    /// 系统已使用内存（字节）
+    used_memory: u64,
+    /// CPU 核心数
+    cpu_count: u32,
+};
+
+/// 获取当前进程资源使用情况（跨平台）
+pub fn getProcessResourceUsage() ProcessResourceUsage {
+    if (builtin.os.tag == .linux) {
+        return getLinuxProcessUsage() catch ProcessResourceUsage{
+            .memory_rss = 0,
+            .memory_vsz = 0,
+            .cpu_usage_percent = 0.0,
+        };
+    } else if (builtin.os.tag == .windows) {
+        return getWindowsProcessUsage() catch ProcessResourceUsage{
+            .memory_rss = 0,
+            .memory_vsz = 0,
+            .cpu_usage_percent = 0.0,
+        };
+    } else {
+        return ProcessResourceUsage{
+            .memory_rss = 0,
+            .memory_vsz = 0,
+            .cpu_usage_percent = 0.0,
+        };
+    }
+}
+
+/// 获取系统资源使用情况（跨平台）
+pub fn getSystemResourceUsage() SystemResourceUsage {
+    const mem_info = getMemoryInfo();
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+
+    return SystemResourceUsage{
+        .total_memory = mem_info.total,
+        .available_memory = mem_info.available,
+        .used_memory = if (mem_info.total > mem_info.available)
+            mem_info.total - mem_info.available
+        else
+            0,
+        .cpu_count = @intCast(cpu_count),
+    };
+}
+
+// ========================================================================
+// Linux 进程资源监控
+// ========================================================================
+
+/// Linux 进程资源使用（从 /proc/self/stat 和 /proc/self/status）
+fn getLinuxProcessUsage() !ProcessResourceUsage {
+    // 读取 /proc/self/status 获取内存信息
+    const status_file = std.fs.openFileAbsolute("/proc/self/status", .{}) catch {
+        return ProcessResourceUsage{ .memory_rss = 0, .memory_vsz = 0, .cpu_usage_percent = 0.0 };
+    };
+    defer status_file.close();
+
+    var buffer: [8192]u8 = undefined;
+    const bytes_read = try status_file.readAll(&buffer);
+    const content = buffer[0..bytes_read];
+
+    var rss_kb: u64 = 0;
+    var vsz_kb: u64 = 0;
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "VmRSS:")) {
+            rss_kb = parseMemLine(line);
+        } else if (std.mem.startsWith(u8, line, "VmSize:")) {
+            vsz_kb = parseMemLine(line);
+        }
+    }
+
+    // CPU 使用率计算需要两次采样，这里简化为 0（避免阻塞）
+    // 实际生产环境可以在后台线程定期采样
+    const cpu_percent: f64 = 0.0;
+
+    return ProcessResourceUsage{
+        .memory_rss = rss_kb * 1024, // KB -> Bytes
+        .memory_vsz = vsz_kb * 1024, // KB -> Bytes
+        .cpu_usage_percent = cpu_percent,
+    };
+}
+
+// ========================================================================
+// Windows 进程资源监控
+// ========================================================================
+
+/// Windows 进程资源使用
+fn getWindowsProcessUsage() !ProcessResourceUsage {
+    const windows = std.os.windows;
+
+    // PROCESS_MEMORY_COUNTERS_EX 结构体
+    const PROCESS_MEMORY_COUNTERS_EX = extern struct {
+        cb: windows.DWORD,
+        PageFaultCount: windows.DWORD,
+        PeakWorkingSetSize: windows.SIZE_T,
+        WorkingSetSize: windows.SIZE_T,
+        QuotaPeakPagedPoolUsage: windows.SIZE_T,
+        QuotaPagedPoolUsage: windows.SIZE_T,
+        QuotaPeakNonPagedPoolUsage: windows.SIZE_T,
+        QuotaNonPagedPoolUsage: windows.SIZE_T,
+        PagefileUsage: windows.SIZE_T,
+        PeakPagefileUsage: windows.SIZE_T,
+        PrivateUsage: windows.SIZE_T,
+    };
+
+    const GetProcessMemoryInfo = struct {
+        extern "psapi" fn GetProcessMemoryInfo(
+            hProcess: windows.HANDLE,
+            ppsmemCounters: *PROCESS_MEMORY_COUNTERS_EX,
+            cb: windows.DWORD,
+        ) callconv(.winapi) windows.BOOL;
+    }.GetProcessMemoryInfo;
+
+    const GetCurrentProcess = struct {
+        extern "kernel32" fn GetCurrentProcess() callconv(.winapi) windows.HANDLE;
+    }.GetCurrentProcess;
+
+    var mem_counters = std.mem.zeroes(PROCESS_MEMORY_COUNTERS_EX);
+    mem_counters.cb = @sizeOf(PROCESS_MEMORY_COUNTERS_EX);
+
+    const process_handle = GetCurrentProcess();
+    const result = GetProcessMemoryInfo(
+        process_handle,
+        &mem_counters,
+        @sizeOf(PROCESS_MEMORY_COUNTERS_EX),
+    );
+
+    if (result == 0) {
+        return ProcessResourceUsage{
+            .memory_rss = 0,
+            .memory_vsz = 0,
+            .cpu_usage_percent = 0.0,
+        };
+    }
+
+    return ProcessResourceUsage{
+        .memory_rss = mem_counters.WorkingSetSize, // 工作集大小（类似 RSS）
+        .memory_vsz = mem_counters.PrivateUsage, // 私有字节数（类似 VSZ）
+        .cpu_usage_percent = 0.0, // CPU 使用率需要定期采样，这里简化
+    };
+}

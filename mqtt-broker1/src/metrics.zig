@@ -1,6 +1,7 @@
 const std = @import("std");
 const logger = @import("logger.zig");
 const builtin = @import("builtin");
+const system_info = @import("system_info.zig");
 
 // 针对 32位架构使用 u32 原子类型，64位架构使用 u64
 const AtomicCounterType = if (builtin.target.ptrBitWidth() == 32) u32 else u64;
@@ -201,6 +202,24 @@ pub const Metrics = struct {
             self.errors_protocol.load(.monotonic),
             self.errors_network.load(.monotonic),
         });
+
+        // 获取系统资源使用情况
+        const sys_res = system_info.getSystemResourceUsage();
+        logger.info("System: {d} CPU cores, {d:.2} GB total memory, {d:.2} GB available, {d:.2} GB used", .{
+            sys_res.cpu_count,
+            @as(f64, @floatFromInt(sys_res.total_memory)) / 1024.0 / 1024.0 / 1024.0,
+            @as(f64, @floatFromInt(sys_res.available_memory)) / 1024.0 / 1024.0 / 1024.0,
+            @as(f64, @floatFromInt(sys_res.used_memory)) / 1024.0 / 1024.0 / 1024.0,
+        });
+
+        // 获取进程资源使用情况
+        const proc_res = system_info.getProcessResourceUsage();
+        logger.info("Process: {d:.2} MB memory (RSS), {d:.2} MB virtual, CPU {d:.2}%", .{
+            @as(f64, @floatFromInt(proc_res.memory_rss)) / 1024.0 / 1024.0,
+            @as(f64, @floatFromInt(proc_res.memory_vsz)) / 1024.0 / 1024.0,
+            proc_res.cpu_usage_percent,
+        });
+
         logger.info("============================", .{});
     }
 };

@@ -11,6 +11,7 @@ pub const RuntimeConfig = struct {
     port: u16 = PORT,
     log_enabled: bool = true,
     log_level: logger.Level = DEFAULT_LOG_LEVEL,
+    stats_interval_sec: u32 = STATS_PUBLISH_INTERVAL_SEC, // 统计信息输出间隔（秒）
 };
 
 /// 从 JSON 字符串解析日志级别
@@ -115,9 +116,17 @@ pub fn loadRuntimeConfig(allocator: std.mem.Allocator, path: []const u8) Runtime
                 }
             }
         }
+
+        // 解析统计间隔
+        if (obj.get("stats_interval_sec")) |stats_value| {
+            if (stats_value == .integer) {
+                const interval = @as(u32, @intCast(stats_value.integer));
+                if (interval > 0) rc.stats_interval_sec = interval;
+            }
+        }
     }
 
-    logger.info("Loaded configuration from '{s}' (port={d}, log_level={s})", .{ path, rc.port, @tagName(rc.log_level) });
+    logger.info("Loaded configuration from '{s}' (port={d}, log_level={s}, stats_interval={d}s)", .{ path, rc.port, @tagName(rc.log_level), rc.stats_interval_sec });
     return rc;
 }
 
@@ -129,6 +138,7 @@ fn saveRuntimeConfig(allocator: std.mem.Allocator, path: []const u8, rc: Runtime
     // 手动构建 JSON（与 persistence.zig 风格一致）
     try json_buf.appendSlice(allocator, "{\n");
     try std.fmt.format(json_buf.writer(allocator), "  \"port\": {d},\n", .{rc.port});
+    try std.fmt.format(json_buf.writer(allocator), "  \"stats_interval_sec\": {d},\n", .{rc.stats_interval_sec});
     try json_buf.appendSlice(allocator, "  \"log\": {\n");
     try std.fmt.format(json_buf.writer(allocator), "    \"enabled\": {s},\n", .{if (rc.log_enabled) "true" else "false"});
     try std.fmt.format(json_buf.writer(allocator), "    \"level\": \"{s}\"\n", .{levelToString(rc.log_level)});

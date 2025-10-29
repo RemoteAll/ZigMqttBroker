@@ -1173,6 +1173,7 @@ pub const MqttBroker = struct {
     // 新增字段: 内存池、统计定时器、指标
     client_pool: ClientConnectionPool,
     stats_completion: IO.Completion = undefined,
+    stats_interval_ns: u63, // 统计输出间隔（纳秒）
     metrics: Metrics,
 
     // 订阅持久化管理器
@@ -1183,7 +1184,7 @@ pub const MqttBroker = struct {
     // Key: MQTT Client ID, Value: *Client
     orphan_clients: std.StringHashMap(*Client),
 
-    pub fn init(allocator: Allocator) !*MqttBroker {
+    pub fn init(allocator: Allocator, stats_interval_sec: u32) !*MqttBroker {
         const io = try allocator.create(IO);
         io.* = try IO.init(config.IO_ENTRIES, 0);
 
@@ -1219,6 +1220,7 @@ pub const MqttBroker = struct {
             .subscriptions = subscriptions,
             .server_socket = IO.INVALID_SOCKET,
             .client_pool = client_pool,
+            .stats_interval_ns = @as(u63, @intCast(@as(u64, stats_interval_sec) * std.time.ns_per_s)),
             .metrics = Metrics.init(),
             .persistence = persistence,
             .orphan_clients = std.StringHashMap(*Client).init(allocator),
@@ -1424,7 +1426,7 @@ pub const MqttBroker = struct {
             self,
             onStatsTimeout,
             &self.stats_completion,
-            config.STATS_INTERVAL_NS,
+            self.stats_interval_ns,
         );
     }
 
@@ -1581,7 +1583,7 @@ pub fn main() !void {
     // 打印配置信息
     config.printConfig();
 
-    const broker = MqttBroker.init(allocator) catch |err| {
+    const broker = MqttBroker.init(allocator, runtime_config.stats_interval_sec) catch |err| {
         logger.err("Failed to initialize broker: {any}", .{err});
         return err;
     };
